@@ -1273,6 +1273,9 @@ export default function ChatPanel() {
                 <Send size={18} />
               </button>
             </div>
+            <p className="mt-2 text-center text-[9px] text-twin-muted/70">
+              AI can make mistakes. Please verify important information.
+            </p>
           </form>
         </>
       )}
