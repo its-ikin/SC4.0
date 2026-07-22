@@ -1130,7 +1130,7 @@ export default function ChatPanel() {
   };
 
   return (
-    <aside className="panel flex h-[460px] w-full shrink-0 flex-col border-t border-white/10 lg:h-auto lg:w-[410px] lg:border-l lg:border-t-0">
+    <aside className="panel flex h-[100dvh] w-full shrink-0 flex-col border-t border-white/10 lg:h-auto lg:w-[410px] lg:border-l lg:border-t-0">
       <div className="border-b border-white/[0.075] p-4">
         <div className="flex items-center justify-between gap-3">
           <div>
