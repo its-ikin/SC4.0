@@ -1107,6 +1107,7 @@ export default function ChatPanel() {
     ) return;
     consumedAssistantQueryRequestIdRef.current = assistantQueryRequest.id;
     clearAssistantQueryRequest(assistantQueryRequest.id);
+    setTab("chat");
     void sendQuery(assistantQueryRequest.text);
   }, [assistantQueryRequest, busy, clearAssistantQueryRequest, sendQuery]);
 
