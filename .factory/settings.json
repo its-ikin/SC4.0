@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "core@factory-plugins": true,
+    "droid-control@factory-plugins": true
+  }
+}

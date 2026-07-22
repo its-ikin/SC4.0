@@ -1,0 +1,29 @@
+{
+  "name": "gsk-twinops-ai",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "client",
+    "server",
+    "shared"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "dev": "concurrently -n server,client -c orange,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w @twinops/shared && npm run build -w server && npm run build -w client",
+    "typecheck": "npm run typecheck -w @twinops/shared && npm run typecheck -w server && npm run typecheck -w client",
+    "start:system": ".\\orchestrator.cmd start",
+    "stop:system": ".\\orchestrator.cmd stop",
+    "restart:system": ".\\orchestrator.cmd restart",
+    "status:system": ".\\orchestrator.cmd status",
+    "logs:system": ".\\orchestrator.cmd logs",
+    "seed": "npm run seed -w server",
+    "reset-db": "npm run reset-db -w server",
+    "eval:guardrails": "npm run eval:guardrails -w server",
+    "test": "npm run test -w server && npm run test -w client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}

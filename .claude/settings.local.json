@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npm audit *)",
+      "PowerShell(cd \"C:\\\\Users\\\\junki\\\\Downloads\\\\SC4.0\\\\SC4.0\"; powershell -NoProfile -ExecutionPolicy Bypass -File .\\\\orchestrator.ps1 status)",
+      "PowerShell(cd \"C:\\\\Users\\\\junki\\\\Downloads\\\\SC4.0\\\\SC4.0\"; powershell -NoProfile -ExecutionPolicy Bypass -File .\\\\orchestrator.ps1 restart)",
+      "Bash(curl -s http://localhost:5173 -o /dev/null -w \"client: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:3002/api/health -o /dev/null -w \"server: %{http_code}\\\\n\")",
+      "Bash(curl -N -s -X POST http://localhost:3002/api/chat -H \"Content-Type: application/json\" -d '{\"query\":\"Where is batch SB-LOT-RSV-0702-A located?\"}')",
+      "Bash(curl -s -X POST http://localhost:3002/api/chat -H \"Content-Type: application/json\" -d '{\"query\":\"Simulate prioritising SHIP-001 and show FEFO, dock, and cold-chain impact.\"}' -o /tmp/approval_test.txt)",
+      "Read(//tmp/**)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 5173 -State Listen)",
+      "PowerShell(Stop-Process -Id 24180 -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Id 15984 -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Id 18636 -Force -ErrorAction SilentlyContinue)"
+    ]
+  }
+}
