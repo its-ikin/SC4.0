@@ -2085,8 +2085,19 @@ export function getTemperatureReadings(limit = 520): TemperatureReading[] {
     }));
 }
 
-export function getTemperatureEvents(zoneId?: string): TemperatureEvent[] {
-  return buildTemperatureEvents(getTemperatureReadings(5000), getZones(), zoneId);
+export function getTemperatureEvents(zoneId?: string, skuId?: string): TemperatureEvent[] {
+  let readings = getTemperatureReadings(5000);
+  if (skuId) {
+    const sku = getInventoryPlacements().find(s => s.stockBalanceId === skuId);
+    if (sku && sku.temperatureMin !== undefined && sku.temperatureMax !== undefined) {
+      readings = readings.map(r => ({
+        ...r,
+        allowedMin: sku.temperatureMin,
+        allowedMax: sku.temperatureMax
+      }));
+    }
+  }
+  return buildTemperatureEvents(readings, getZones(), zoneId);
 }
 
 export function getRfidEvents(limit = 40): RfidEvent[] {

@@ -367,7 +367,7 @@ Action logic for tool selection:
 - A broad facility or network simulation does not replace exact lookups for ASNs, shipments, stock balances, lots, docks, or routes named in the same question.
 - Reuse the available general lookup and simulation tools across contexts; do not narrow the whole answer to whichever tool matches the first or largest condition.
 - The request payload may contain a semantic request plan. Use it to understand arbitrary operator wording, event meaning, scope, warning time, duration, and requested outcomes. Do not replace its semantic classification with keyword matching.
-- Use simulate_facility_disruption for an external event affecting a facility, region, or connected warehouse network even when the event name has never appeared before. Pass the event in the operator's terms.
+- Use simulate_facility_disruption for an external event affecting a facility, region, or connected warehouse network even when the event name has never appeared before. Pass the event in the operator's terms. Do NOT use this tool for general stock, FEFO, or quality risk inquiries unless a physical disruptive event (like a fire, outage, or storm) is explicitly stated.
 - Never treat lead time as disruption duration. When duration is unknown, omit durationMinutes; the simulation will expose current movements and return the duration as a data gap.
 - A scenario asking what will happen must never be answered as a verified current-state overview. If exact scenario impact cannot be calculated, return the verified exposure plus the missing scenario inputs.
 - Never call a tool that applies, approves, dispatches, or otherwise mutates warehouse state. No assistant approval workflow exists.
@@ -377,15 +377,21 @@ Action logic for tool selection:
 - Prefer read-only lookup tools over simulation tools unless the question is explicitly a what-if, prioritisation, or impact simulation.
 - Resolve explicit identifiers before broad topic words. An exact stock-balance ID requires its stock record; a named dock requires that dock's schedule rather than an all-dock scan.
 - Use get_warehouse_capacity for warehouse fullness, occupancy, free-space, storage-capacity, location-capacity, and utilisation questions. Do not substitute an inventory quantity summary for physical capacity.
-- Use get_operational_alerts for alert counts, severity breakdowns, open-alert lists, and alert-status questions across operational domains.
+- Use get_operational_alerts for alert counts, severity breakdowns, open-alert lists, and alert-status questions across operational domains. Do NOT use this tool for specific SKU, shipment, or what-if risk questions.
 - Distinguish current readings from event history. For "what is the temperature" use check_cold_chain_status; add get_temperature_events only when the operator asks about excursions, non-conformances, peaks, duration, trends, or history.
 - Use get_transport_context for transport-board, leg, route, ASN, outbound shipment, carrier, vehicle, partner-site, dock-appointment, or cross-system handoff questions. Use the selected UI reference when the operator says "this" or "selected".
 - Use simulate_transport_impact for a what-if involving a specific leg, route, ASN, shipment, or appointment and a delay/disruption. This tool already joins ETA, service window, dock conflicts, WMS lines, inventory exposure, cold-chain risk, stages, and option trade-offs.
+- Use simulate_event_impact for a what-if to see the effects of a general event (like severe weather) on a specific route.
+- Use simulate_shipment_allocation to simulate the before/after impact of allocating stock for an outbound shipment.
+- Use simulate_reprioritisation to simulate the impact of reprioritising an outbound shipment against other demands.
+- Rely heavily on the tool descriptions above to match user questions.
+- If the operator asks vaguely about "risk" or "products at risk" without enough context, explicitly ask them to clarify if they mean inventory replenishment/stockout risk, expiry risk, cold-chain temperature risk, or shipment delay risk.
 - Never substitute SHIP-001 or another default when the operator supplied a different reference. If a what-if has no exact reference, use get_transport_context to show scope and allow the formatter to request one.
 - Use locate_sku for an exact stock-balance ID; it returns location, lot, STO, expiry, quality status, quantities, and linked execution context. Add get_batch_detail when movements, inbound/outbound lines, arrival, putaway, dwell, or full batch history are requested.
 - Use search_inventory for lists of stock by product name, material code, quality status, zone, location, STO, goods receipt, handling unit, or inspection lot.
-- Use get_inventory_planning when the operator asks about the Inventory Planning dashboard, a replenishment projection, a forecast horizon, a demand multiplier, projected stock-out, or projected expiry risk.
+- Use get_inventory_planning when the operator asks about the Inventory Planning dashboard, a replenishment projection, a forecast horizon, a demand multiplier, projected stock-out, projected expiry risk, or a summary of products at risk.
 - Use check_fefo_allocation whenever the operator asks which lots are eligible, excluded, or should be consumed first.
+- Use check_fefo_impact whenever the operator asks about the shipment or allocation impact/risks of a specific lot or stock balance.
 - A cold-chain status check does not prove FEFO eligibility. When the operator asks about both, gather both sets of evidence; never infer FEFO availability from an in-band temperature result.
 - If the request covers several products, use search_inventory to identify the products in scope, then run the relevant FEFO checks rather than declaring every cold-chain lot eligible.
 - Stop calling tools once you have enough information. Do not call the same tool with the same arguments twice.`;

@@ -112,17 +112,6 @@ export default function InventoryPlanningView({ snapshot }: Props) {
     setSelectedStockBalance(stockBalanceId);
   };
 
-  const askAssistant = () => {
-    if (!selected) return;
-    const stockout = selected.stockoutDay === null ? "not projected" : `day ${selected.stockoutDay}`;
-    requestAssistantQuery(
-      `Review replenishment and expiry risk for ${selected.product.productCode} (${selected.product.productId}). `
-      + `The Inventory Planning screen is testing a ${horizonDays}-day horizon at ${demandMultiplier.toFixed(2)}x average demand. `
-      + `The displayed deterministic snapshot shows risk ${selected.risk}, ${selected.availableNow} available now, ${selected.plannedInbound} eligible inbound units within the horizon, ${selected.projectedAtLeadTime} projected at lead time, ${selected.projectedAtHorizon} projected at the horizon, stock-out ${stockout}, ${selected.expiryRiskUnits} expiry-risk units, and ${selected.recommendedOrderQty} suggested replenishment units. `
-      + `Use the authoritative inventory-planning calculation to verify this displayed snapshot, explain the risk, and suggest a safe read-only action. `
-      + `Treat the horizon and demand multiplier as scenario assumptions, not operational facts.`
-    );
-  };
 
   const summaryCards = [
     { label: "Products at risk", value: plan.summary.productsAtRisk, detail: `of ${plan.rows.length} products`, icon: AlertTriangle, tone: plan.summary.productsAtRisk ? "text-twin-critical" : "text-twin-green" },
@@ -270,13 +259,6 @@ export default function InventoryPlanningView({ snapshot }: Props) {
                     ["Stock-out", selected.stockoutDay === null ? "Not projected" : `Day ${selected.stockoutDay}`]
                   ].map(([label, value]) => <div key={label} className="rounded-xl border border-twin-border/70 bg-white/70 p-3"><dt className="uppercase tracking-wide text-twin-muted">{label}</dt><dd className="mt-1 text-xs font-semibold text-twin-text">{value}</dd></div>)}
                 </dl>
-                <button
-                  className="mt-3 flex w-full items-center gap-2 rounded-xl bg-twin-orange px-3 py-2.5 text-left text-sm font-semibold text-white"
-                  onClick={askAssistant}
-                >
-                  <Sparkles size={16} />
-                  Ask Assistant
-                </button>
               </section>
 
               <section className="panel rounded-2xl p-4">

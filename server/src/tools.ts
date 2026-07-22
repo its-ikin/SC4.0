@@ -342,7 +342,7 @@ export function get_product_stock(productId: string) {
   return stock;
 }
 
-export function get_inventory_planning(productId: string, horizonDays = 14, demandMultiplier = 1) {
+export function get_inventory_planning(productId?: string, horizonDays = 14, demandMultiplier = 1) {
   const inventory = getInventoryData();
   const latestStockUpdate = inventory.stockBalances.reduce((latest, balance) => {
     const timestamp = new Date(balance.lastUpdated).getTime();
@@ -353,6 +353,21 @@ export function get_inventory_planning(productId: string, horizonDays = 14, dema
     demandMultiplier,
     asOf: latestStockUpdate ? new Date(latestStockUpdate) : new Date()
   });
+  
+  if (!productId) {
+    return {
+      asOf: plan.asOf,
+      horizonDays: plan.horizonDays,
+      demandMultiplier: plan.demandMultiplier,
+      summary: plan.summary,
+      topRisks: plan.rows.filter((r) => r.risk !== "healthy").slice(0, 5).map((r) => ({
+        productCode: r.product.productCode,
+        risk: r.risk,
+        riskReason: r.riskReason
+      }))
+    };
+  }
+
   const needle = productId.trim().toLowerCase();
   const row = plan.rows.find(({ product }) =>
     product.productId.toLowerCase() === needle || product.productCode.toLowerCase() === needle
@@ -593,9 +608,10 @@ export function check_fefo_impact(stockBalanceId: string, shipmentId: string) {
   };
 }
 
-export function check_cold_chain_status(zoneId: string, skuId?: string) {
-  const zone = findZone(zoneId);
+export function check_cold_chain_status(zoneId?: string, skuId?: string) {
   const sku = skuId ? findInventoryPlacement(skuId) : null;
+  const resolvedZoneId = sku ? sku.zoneId : (zoneId || "Cold Storage");
+  const zone = findZone(resolvedZoneId);
   const min = sku?.temperatureMin ?? zone.temperatureMin;
   const max = sku?.temperatureMax ?? zone.temperatureMax;
   const current = zone.currentTemperature;
@@ -603,7 +619,7 @@ export function check_cold_chain_status(zoneId: string, skuId?: string) {
   const readings = db
     .prepare("SELECT * FROM temperature_readings WHERE zone_id = ? ORDER BY datetime(timestamp) DESC LIMIT 36")
     .all(zone.id) as { temperature: number; within_band: number; timestamp: string }[];
-  const consecutiveBreachCount = readings.findIndex((reading) => Boolean(reading.within_band));
+  const consecutiveBreachCount = readings.findIndex((reading) => reading.temperature >= min && reading.temperature <= max);
   const timeInBreachMinutes =
     breachSeverity === "none" ? 0 : consecutiveBreachCount === -1 ? readings.length * 5 : Math.max(1, consecutiveBreachCount) * 5;
   const affectedSkus = getInventoryPlacements()
@@ -629,10 +645,12 @@ export function check_cold_chain_status(zoneId: string, skuId?: string) {
   };
 }
 
-export function get_temperature_events(zoneId?: string, eventType?: string) {
-  const resolvedZone = zoneId ? findZone(zoneId) : null;
+export function get_temperature_events(zoneId?: string, eventType?: string, skuId?: string) {
+  const sku = skuId ? findInventoryPlacement(skuId) : null;
+  const resolvedZoneId = sku ? sku.zoneId : zoneId;
+  const resolvedZone = resolvedZoneId ? findZone(resolvedZoneId) : null;
   const normalizedType = eventType?.trim().toLowerCase();
-  const events = getTemperatureEvents(resolvedZone?.id).filter((event) => {
+  const events = getTemperatureEvents(resolvedZone?.id, skuId).filter((event) => {
     if (!normalizedType) return true;
     return event.eventType.toLowerCase() === normalizedType || event.eventType.toLowerCase().replace("-", " ") === normalizedType;
   });
@@ -1190,7 +1208,7 @@ export function simulate_facility_disruption(
   leadTimeMinutesInput?: number | string,
   affectedFlowInput?: string
 ) {
-  const eventType = eventTypeInput.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "external_disruption";
+  const eventType = String(eventTypeInput ?? "external_disruption").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "external_disruption";
   const requestedDuration = Number(durationMinutesInput);
   const durationKnown = Number.isFinite(requestedDuration) && requestedDuration > 0;
   const durationMinutes = durationKnown

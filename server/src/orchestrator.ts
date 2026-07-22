@@ -44,9 +44,9 @@ type SemanticRequestPlan = {
 
 const SEMANTIC_REQUEST_PLANNER_PROMPT = `Interpret an operator request for a pharmaceutical warehouse control tower.
 Return JSON only. Understand arbitrary wording and previously unseen events semantically; never rely on an event-name whitelist.
-Separate time until an event begins (leadTimeMinutes) from how long operations are disrupted (durationMinutes). Never convert one into the other.
+Separate time until an event begins (leadTimeMinutes) from how long operations are disrupted (durationMinutes). Convert any time values (like hours or days) into minutes.
 Preserve the operator's scope exactly. Singapore is a regional/network scope, not automatically Singapore Western DC.
-Treat questions asking what will happen, consequences, effects, exposure, or future outcomes as scenarios even when they do not say "what-if" or "simulate".
+Treat questions asking what will happen, consequences, effects, exposure, or future outcomes as scenarios even when they do not say "what-if" or "simulate". However, routine operational checks for quality, FEFO, or shipment risks are NOT scenarios unless a physical disruptive event (like a fire, outage, or storm) is explicitly stated.
 List every requested outcome and explicit identifier so no clause can be dropped.
 Use this schema:
 {
@@ -260,7 +260,7 @@ const AGENT_TOOL_SPECS = [
           horizonDays: { type: "number", description: "Projection horizon in days, normally 7, 14, or 30." },
           demandMultiplier: { type: "number", description: "Scenario multiplier applied to configured average daily demand." }
         },
-        required: ["productId", "horizonDays", "demandMultiplier"],
+        required: ["horizonDays", "demandMultiplier"],
         additionalProperties: false
       }
     }
@@ -402,7 +402,8 @@ const AGENT_TOOL_SPECS = [
         type: "object",
         properties: {
           zoneId: { type: "string", description: "Optional zone ID or name to filter by." },
-          eventType: { type: "string", description: "Optional event type, e.g. Excursion or Non-Conformance." }
+          eventType: { type: "string", description: "Optional event type, e.g. Excursion or Non-Conformance." },
+          skuId: { type: "string", description: "Optional stock-balance ID or SKU to filter by." }
         },
         additionalProperties: false
       }
@@ -502,8 +503,8 @@ const AGENT_TOOL_SPECS = [
         properties: {
           eventType: { type: "string", description: "The event in the operator's own terms, e.g. tsunami, cyberattack, labour disruption, severe weather, access restriction, or power outage." },
           scope: { type: "string", description: "Affected place or operational scope stated by the operator. Do not invent a more specific facility." },
-          leadTimeMinutes: { type: "number", description: "Time until the event begins. This is not the disruption duration." },
-          durationMinutes: { type: "number", description: "Expected operational disruption duration, only when explicitly provided." },
+          leadTimeMinutes: { type: "number", description: "Time until the event begins in minutes. Convert hours or days to minutes. This is not the disruption duration." },
+          durationMinutes: { type: "number", description: "Expected operational disruption duration in minutes. Convert hours or days to minutes. Provide only when explicitly stated." },
           affectedFlow: { type: "string", enum: ["inbound", "outbound", "all"], description: "Flow the operator asks about." }
         },
         required: ["eventType"],
@@ -1083,6 +1084,11 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
     text.includes("inventory planning") ||
     text.includes("replenishment and expiry risk") ||
     text.includes("demand multiplier") ||
+    text.includes("products at risk") ||
+    text.includes("stockout risk") ||
+    text.includes("risk of stockout") ||
+    text.includes("expiry risk") ||
+    text.includes("risk of expiry") ||
     (text.includes("projected") && text.includes("replenishment"))
   ) {
     agents.add("Inventory");
@@ -1097,7 +1103,13 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
         }
       });
     } else {
-      tools.push({ name: "search_inventory", input: { query } });
+      tools.push({
+        name: "get_inventory_planning",
+        input: {
+          horizonDays: extractPlanningHorizon(query),
+          demandMultiplier: extractDemandMultiplier(query)
+        }
+      });
     }
     return { agents: [...agents], tools, intent: "stock_position" };
   }
@@ -1162,7 +1174,7 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
   if (text.includes("temperature") || text.includes("cold-chain") || text.includes("cold chain")) {
     agents.add("Compliance");
     agents.add("Inventory");
-    if (requestsTemperatureHistory(query)) tools.push({ name: "get_temperature_events", input: { zoneId: extractZone(query) } });
+    if (requestsTemperatureHistory(query)) tools.push({ name: "get_temperature_events", input: { zoneId: extractZone(query), skuId } });
     tools.push({ name: "check_cold_chain_status", input: { zoneId: extractZone(query), skuId } });
     return { agents: [...agents], tools, intent: "temperature_event" };
   }
@@ -1653,39 +1665,60 @@ function deterministicAgentResponse(
     };
   }
 
-  if (outputs.get_operational_alerts) return operationalAlertsResponse(outputs.get_operational_alerts);
-  if (outputs.get_warehouse_capacity) return warehouseCapacityResponse(outputs.get_warehouse_capacity);
-  if (outputs.locate_sku && intent === "sku_location") return stockLocationResponse(outputs.locate_sku, outputs.check_fefo_impact ?? outputs.check_fefo_allocation);
+  if (outputs.locate_sku) return stockLocationResponse(outputs.locate_sku, outputs.check_fefo_impact ?? outputs.check_fefo_allocation);
   if (outputs.check_dock_schedule) return dockScheduleResponse(outputs.check_dock_schedule);
   if (outputs.check_cold_chain_status && !requestsTemperatureHistory(query)) return currentTemperatureResponse(outputs.check_cold_chain_status);
 
   if (outputs.get_inventory_planning) {
     const plan = outputs.get_inventory_planning;
-    const stockout = plan.stockoutDay === null ? "not projected" : `day ${plan.stockoutDay}`;
-    const action = plan.recommendedOrderQty > 0
-      ? `Review a replenishment quantity of ${plan.recommendedOrderQty} units against the incoming schedule before any operational order is raised.`
-      : plan.expiryRiskUnits > 0
-        ? "Prioritise the listed released lots through FEFO and review demand coverage before replenishing."
-        : "Monitor the projection; no replenishment is suggested by the current policy thresholds.";
-    return {
-      intent: "stock_position",
-      status: plan.risk === "healthy" ? "ok" : "attention",
-      title: "Inventory Planning Review",
-      summary: `${plan.product.productCode} is ${plan.risk} risk in the verified ${plan.horizonDays}-day, ${plan.demandMultiplier.toFixed(2)}x demand scenario: ${plan.availableNow} available now and ${plan.projectedAtHorizon} projected at the horizon.`,
-      facts: [
-        { label: "Available now", value: String(plan.availableNow) },
-        { label: "Projected at lead time", value: String(plan.projectedAtLeadTime) },
-        { label: "Projected at horizon", value: String(plan.projectedAtHorizon) },
-        { label: "Stock-out", value: stockout },
-        { label: "Expiry-risk units", value: String(plan.expiryRiskUnits) },
-        { label: "Suggested replenishment", value: String(plan.recommendedOrderQty) }
-      ],
-      impact: [plan.riskReason, action, "This projection is advisory and did not change inventory or create an order."],
-      nextAction: { label: "Open Inventory", type: "open_inventory", targetId: plan.product.productId },
-      requiresApproval: false,
-      dataGaps: [],
-      confidence: "high"
-    };
+    if (plan.summary) {
+      return {
+        intent: "stock_position",
+        status: plan.summary.productsAtRisk > 0 ? "attention" : "ok",
+        title: "Inventory Planning Summary",
+        summary: `The verified ${plan.horizonDays}-day, ${plan.demandMultiplier.toFixed(2)}x demand scenario projects ${plan.summary.productsAtRisk} products at risk out of the portfolio.`,
+        facts: [
+          { label: "Products at risk", value: String(plan.summary.productsAtRisk) },
+          { label: "Critical risks", value: String(plan.summary.criticalRisks) },
+          { label: "Warning risks", value: String(plan.summary.warningRisks) },
+          { label: "Expiry risks", value: String(plan.summary.expiryRisks) }
+        ],
+        impact: [
+          ...plan.topRisks.map((r: any) => `${r.productCode} (${r.risk}): ${r.riskReason}`),
+          "This projection is advisory and did not change inventory or create an order."
+        ],
+        nextAction: { label: "Open Inventory", type: "open_inventory", targetId: null },
+        requiresApproval: false,
+        dataGaps: [],
+        confidence: "high"
+      };
+    } else {
+      const stockout = plan.stockoutDay === null ? "not projected" : `day ${plan.stockoutDay}`;
+      const action = plan.recommendedOrderQty > 0
+        ? `Review a replenishment quantity of ${plan.recommendedOrderQty} units against the incoming schedule before any operational order is raised.`
+        : plan.expiryRiskUnits > 0
+          ? "Prioritise the listed released lots through FEFO and review demand coverage before replenishing."
+          : "Monitor the projection; no replenishment is suggested by the current policy thresholds.";
+      return {
+        intent: "stock_position",
+        status: plan.risk === "healthy" ? "ok" : "attention",
+        title: "Inventory Planning Review",
+        summary: `${plan.product.productCode} is ${plan.risk} risk in the verified ${plan.horizonDays}-day, ${plan.demandMultiplier.toFixed(2)}x demand scenario: ${plan.availableNow} available now and ${plan.projectedAtHorizon} projected at the horizon.`,
+        facts: [
+          { label: "Available now", value: String(plan.availableNow) },
+          { label: "Projected at lead time", value: String(plan.projectedAtLeadTime) },
+          { label: "Projected at horizon", value: String(plan.projectedAtHorizon) },
+          { label: "Stock-out", value: stockout },
+          { label: "Expiry-risk units", value: String(plan.expiryRiskUnits) },
+          { label: "Suggested replenishment", value: String(plan.recommendedOrderQty) }
+        ],
+        impact: [plan.riskReason, action, "This projection is advisory and did not change inventory or create an order."],
+        nextAction: { label: "Open Inventory", type: "open_inventory", targetId: plan.product.productId },
+        requiresApproval: false,
+        dataGaps: [],
+        confidence: "high"
+      };
+    }
   }
 
   if (transportSimulation) {
@@ -1809,6 +1842,9 @@ function deterministicAgentResponse(
       confidence: "high"
     };
   }
+  
+  if (outputs.get_warehouse_capacity) return warehouseCapacityResponse(outputs.get_warehouse_capacity);
+  if (outputs.get_operational_alerts) return operationalAlertsResponse(outputs.get_operational_alerts);
 
   return {
     intent,
@@ -1983,9 +2019,15 @@ function buildPayloadAndEvidence(intent: string, executions: ToolExecution[], an
   if (outputs.get_inventory_planning) {
     const planning = outputs.get_inventory_planning;
     payload.type = "scenario_analysis";
-    payload.affectedSKUs.push(planning.product.productCode, ...planning.expiryRiskLots.map((lot: any) => lot.stockBalanceId));
-    payload.affectedStages.push("Storage", "Replenishment planning");
-    riskLevel = planning.risk === "critical" ? "critical" : planning.risk === "healthy" ? "low" : "medium";
+    if (planning.summary) {
+      payload.affectedSKUs.push(...planning.topRisks.map((r: any) => r.productCode));
+      payload.affectedStages.push("Storage", "Replenishment planning");
+      riskLevel = planning.summary.productsAtRisk > 0 ? "medium" : "low";
+    } else {
+      payload.affectedSKUs.push(planning.product.productCode, ...planning.expiryRiskLots.map((lot: any) => lot.stockBalanceId));
+      payload.affectedStages.push("Storage", "Replenishment planning");
+      riskLevel = planning.risk === "critical" ? "critical" : planning.risk === "healthy" ? "low" : "medium";
+    }
     confidence = Math.max(confidence, 95);
   }
   if (outputs.get_batch_detail) {
@@ -2140,7 +2182,7 @@ function alignAgentResponse(
   }
 
   const facilitySimulation = outputs.simulate_facility_disruption;
-  if (facilitySimulation) {
+  if (facilitySimulation && routedIntent === "scenario_simulation") {
     const presentation = facilityScenarioPresentation(query, executions, facilitySimulation);
     aligned = {
       ...aligned,
@@ -2156,18 +2198,16 @@ function alignAgentResponse(
       dataGaps: presentation.dataGaps,
       confidence: facilitySimulation.durationKnown === false ? "medium" : "high"
     };
-  }
-
-  if (outputs.get_operational_alerts) {
-    aligned = operationalAlertsResponse(outputs.get_operational_alerts);
-  } else if (outputs.get_warehouse_capacity) {
-    aligned = warehouseCapacityResponse(outputs.get_warehouse_capacity);
-  } else if (outputs.locate_sku && routedIntent === "sku_location") {
+  } else if (outputs.locate_sku && ["sku_location", "fefo_check", "batch_detail"].includes(routedIntent)) {
     aligned = stockLocationResponse(outputs.locate_sku, outputs.check_fefo_impact ?? outputs.check_fefo_allocation);
-  } else if (outputs.check_dock_schedule) {
+  } else if (outputs.check_dock_schedule && routedIntent === "route_status") {
     aligned = dockScheduleResponse(outputs.check_dock_schedule);
-  } else if (outputs.check_cold_chain_status && !requestsTemperatureHistory(query)) {
+  } else if (outputs.check_cold_chain_status && routedIntent === "temperature_event" && !requestsTemperatureHistory(query)) {
     aligned = currentTemperatureResponse(outputs.check_cold_chain_status);
+  } else if (outputs.get_warehouse_capacity && routedIntent === "general_question") {
+    aligned = warehouseCapacityResponse(outputs.get_warehouse_capacity);
+  } else if (outputs.get_operational_alerts && routedIntent === "general_question") {
+    aligned = operationalAlertsResponse(outputs.get_operational_alerts);
   }
 
   const exactTransport = outputs.get_transport_context?.query && outputs.get_transport_context?.recordCount === 1
