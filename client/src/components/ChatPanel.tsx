@@ -1003,7 +1003,11 @@ export default function ChatPanel() {
   const inspectorMode = view === "Warehouse" || view === "Inventory";
   const warehouseMode = view === "Warehouse";
   const inventoryMode = view === "Inventory";
-  const [tab, setTab] = useState<ChatTab>(inventoryMode ? "inspector" : "chat");
+  const forceChatTab = useAppStore((state) => state.forceChatTab);
+  const [tab, setTab] = useState<ChatTab>(() => {
+    if (useAppStore.getState().forceChatTab) return "chat";
+    return inventoryMode ? "inspector" : "chat";
+  });
   const [selectedDecisionId, setSelectedDecisionId] = useState<string | null>(null);
   const messages = useAppStore((state) => state.messages);
   const assistantQueryRequest = useAppStore((state) => state.assistantQueryRequest);
@@ -1015,12 +1019,17 @@ export default function ChatPanel() {
   const setHighlightFromResponse = useAppStore((state) => state.setHighlightFromResponse);
 
   useEffect(() => {
+    if (forceChatTab) {
+      setTab("chat");
+      useAppStore.setState({ forceChatTab: false });
+      return;
+    }
     if (inventoryMode) {
       setTab("inspector");
       return;
     }
     setTab((current) => (current === "inspector" ? "chat" : current));
-  }, [inventoryMode, view]);
+  }, [inventoryMode, view, forceChatTab]);
 
   const conversationMessages = messages.filter((message) => message.role !== "autonomous");
   const chatScrollRef = useRef<HTMLDivElement>(null);

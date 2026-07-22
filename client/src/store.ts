@@ -75,6 +75,7 @@ type AlertsPageRequest = {
 export type AppState = {
   view: ViewKey;
   chatOpen: boolean;
+  forceChatTab: boolean;
   assistantQueryRequest: AssistantQueryRequest | null;
   auditFocusRequest: AuditFocusRequest | null;
   alertsPageRequest: AlertsPageRequest | null;
@@ -432,6 +433,7 @@ export const useAppStore = create<AppState>((set) => ({
   scenarioResult: null,
   rfidFeed: [],
   toasts: [],
+  forceChatTab: false,
   setView: (view) => set({ view }),
   setWarehouseWorkspace: (warehouseWorkspace) => set({ warehouseWorkspace }),
   setInventoryWorkspace: (inventoryWorkspace) => set({ inventoryWorkspace }),
@@ -440,6 +442,7 @@ export const useAppStore = create<AppState>((set) => ({
   setChatOpen: (chatOpen) => set({ chatOpen }),
   requestAssistantQuery: (text) => set({
     chatOpen: true,
+    forceChatTab: true,
     assistantQueryRequest: { id: ++nextAssistantQueryRequestId, text }
   }),
   clearAssistantQueryRequest: (id) => set((state) => ({
