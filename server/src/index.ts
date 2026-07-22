@@ -43,7 +43,7 @@ import { getActiveOperationalIssues, getOperationalIssueLifecycleEvents, reconci
 import { AuditExportScopeError, filterAuditEventsForExport, parseAuditExportScope } from "./auditExport";
 
 const serverDir = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: resolve(serverDir, "../.env") });
+dotenv.config({ path: resolve(serverDir, "../.env"), override: true });
 
 const app = express();
 const server = createServer(app);

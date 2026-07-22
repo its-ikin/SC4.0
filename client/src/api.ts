@@ -1,9 +1,7 @@
 import type { AgentName, AnalysisPriority, AssistantUiContext, InboundRoute, LatLng, OrchestratorResponse, SimulateRequest, WarehouseSnapshot } from "@twinops/shared";
 
-const API_BASE = import.meta.env.VITE_API_URL || "";
-
 export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${url}`, {
+  const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init
   });
@@ -61,7 +59,7 @@ export async function streamChat(
   analysisPriority: AnalysisPriority = "balanced",
   uiContext?: AssistantUiContext
 ) {
-  const response = await fetch(`${API_BASE}/api/chat`, {
+  const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, conversationHistory: [], analysisPriority, uiContext })

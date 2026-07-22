@@ -205,7 +205,7 @@ Use this exact schema:
   ],
   "nextAction": {
     "label": "Single recommended next action",
-    "type": "none | open_inventory | locate_warehouse | open_logistics | open_monitoring | open_audit | run_fefo_check | run_simulation | review_non_conformance",
+    "type": "none | open_inventory | locate_warehouse | open_logistics | open_monitoring | open_alerts | open_audit | run_fefo_check | run_simulation | review_non_conformance",
     "targetId": "ID from context or null"
   },
   "requiresApproval": false,
@@ -366,15 +366,23 @@ Action logic for tool selection:
 - Decompose multi-condition questions before choosing tools. Make a coverage checklist of every explicit identifier, operational condition, and requested domain, and gather evidence for each checklist item.
 - A broad facility or network simulation does not replace exact lookups for ASNs, shipments, stock balances, lots, docks, or routes named in the same question.
 - Reuse the available general lookup and simulation tools across contexts; do not narrow the whole answer to whichever tool matches the first or largest condition.
+- The request payload may contain a semantic request plan. Use it to understand arbitrary operator wording, event meaning, scope, warning time, duration, and requested outcomes. Do not replace its semantic classification with keyword matching.
+- Use simulate_facility_disruption for an external event affecting a facility, region, or connected warehouse network even when the event name has never appeared before. Pass the event in the operator's terms.
+- Never treat lead time as disruption duration. When duration is unknown, omit durationMinutes; the simulation will expose current movements and return the duration as a data gap.
+- A scenario asking what will happen must never be answered as a verified current-state overview. If exact scenario impact cannot be calculated, return the verified exposure plus the missing scenario inputs.
 - Never call a tool that applies, approves, dispatches, or otherwise mutates warehouse state. No assistant approval workflow exists.
 - If the operator asks to "apply", "approve", or "dispatch" something, call no mutation tool. The formatting step will explain that the assistant is advisory only.
 - If the question is conversational and answerable without warehouse facts (greetings, clarifying questions), call no tools.
 - If the query references data outside the warehouse's scope (out-of-distribution) or conflicts with other tool results you already retrieved, still call the tools that are relevant, and let the formatting step surface the conflict or gap rather than guessing.
 - Prefer read-only lookup tools over simulation tools unless the question is explicitly a what-if, prioritisation, or impact simulation.
+- Resolve explicit identifiers before broad topic words. An exact stock-balance ID requires its stock record; a named dock requires that dock's schedule rather than an all-dock scan.
+- Use get_warehouse_capacity for warehouse fullness, occupancy, free-space, storage-capacity, location-capacity, and utilisation questions. Do not substitute an inventory quantity summary for physical capacity.
+- Use get_operational_alerts for alert counts, severity breakdowns, open-alert lists, and alert-status questions across operational domains.
+- Distinguish current readings from event history. For "what is the temperature" use check_cold_chain_status; add get_temperature_events only when the operator asks about excursions, non-conformances, peaks, duration, trends, or history.
 - Use get_transport_context for transport-board, leg, route, ASN, outbound shipment, carrier, vehicle, partner-site, dock-appointment, or cross-system handoff questions. Use the selected UI reference when the operator says "this" or "selected".
 - Use simulate_transport_impact for a what-if involving a specific leg, route, ASN, shipment, or appointment and a delay/disruption. This tool already joins ETA, service window, dock conflicts, WMS lines, inventory exposure, cold-chain risk, stages, and option trade-offs.
 - Never substitute SHIP-001 or another default when the operator supplied a different reference. If a what-if has no exact reference, use get_transport_context to show scope and allow the formatter to request one.
-- Use get_batch_detail when the operator asks for STO, goods receipt, handling unit, inspection lot, arrival, putaway, dwell context, expiry, or full WMS traceability for a known lot or stock item.
+- Use locate_sku for an exact stock-balance ID; it returns location, lot, STO, expiry, quality status, quantities, and linked execution context. Add get_batch_detail when movements, inbound/outbound lines, arrival, putaway, dwell, or full batch history are requested.
 - Use search_inventory for lists of stock by product name, material code, quality status, zone, location, STO, goods receipt, handling unit, or inspection lot.
 - Use get_inventory_planning when the operator asks about the Inventory Planning dashboard, a replenishment projection, a forecast horizon, a demand multiplier, projected stock-out, or projected expiry risk.
 - Use check_fefo_allocation whenever the operator asks which lots are eligible, excluded, or should be consumed first.

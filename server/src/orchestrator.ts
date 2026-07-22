@@ -27,6 +27,106 @@ const stringify = (value: unknown) => JSON.stringify(value);
 
 type ToolPlan = { name: string; input: Record<string, unknown> };
 
+type SemanticRequestPlan = {
+  requestType: "current_state" | "scenario" | "comparison" | "instruction" | "general";
+  intent: AgentIntent;
+  event: string | null;
+  scope: string | null;
+  scopeType: "facility" | "transport_network" | "route" | "inventory" | "unknown";
+  leadTimeMinutes: number | null;
+  durationMinutes: number | null;
+  affectedFlow: "inbound" | "outbound" | "all";
+  affectedDomains: string[];
+  requestedOutcomes: string[];
+  explicitReferences: string[];
+  missingInputs: string[];
+};
+
+const SEMANTIC_REQUEST_PLANNER_PROMPT = `Interpret an operator request for a pharmaceutical warehouse control tower.
+Return JSON only. Understand arbitrary wording and previously unseen events semantically; never rely on an event-name whitelist.
+Separate time until an event begins (leadTimeMinutes) from how long operations are disrupted (durationMinutes). Never convert one into the other.
+Preserve the operator's scope exactly. Singapore is a regional/network scope, not automatically Singapore Western DC.
+Treat questions asking what will happen, consequences, effects, exposure, or future outcomes as scenarios even when they do not say "what-if" or "simulate".
+List every requested outcome and explicit identifier so no clause can be dropped.
+Use this schema:
+{
+  "requestType":"current_state|scenario|comparison|instruction|general",
+  "intent":"stock_position|incoming_stock|outbound_stock|sku_location|batch_detail|fefo_check|shipment_impact|route_status|transport_status|temperature_event|non_conformance|audit_lookup|scenario_simulation|general_question|unavailable",
+  "event":"operator event wording or null",
+  "scope":"operator scope wording or null",
+  "scopeType":"facility|transport_network|route|inventory|unknown",
+  "leadTimeMinutes":null,
+  "durationMinutes":null,
+  "affectedFlow":"inbound|outbound|all",
+  "affectedDomains":[],
+  "requestedOutcomes":[],
+  "explicitReferences":[],
+  "missingInputs":[]
+}`;
+
+let openAiUnavailableUntil = 0;
+
+function isOpenAiAuthenticationError(error: unknown) {
+  const status = Number((error as any)?.status);
+  const code = String((error as any)?.code ?? (error as any)?.error?.code ?? "").toLowerCase();
+  return status === 401 || code === "invalid_api_key";
+}
+
+function markOpenAiUnavailable(error: unknown) {
+  if (isOpenAiAuthenticationError(error)) openAiUnavailableUntil = Date.now() + 5 * 60_000;
+}
+
+function finitePositiveOrNull(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : null;
+}
+
+async function interpretRequestWithAgent(client: OpenAI, model: string, query: string, uiContext?: AssistantUiContext): Promise<SemanticRequestPlan | null> {
+  try {
+    const completion = await client.chat.completions.create({
+      model,
+      temperature: 0,
+      max_tokens: 450,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SEMANTIC_REQUEST_PLANNER_PROMPT },
+        { role: "user", content: `${uiContextPrompt(uiContext)}\n\nOperator request: ${query}` }
+      ]
+    });
+    const raw = JSON.parse(completion.choices?.[0]?.message?.content ?? "{}");
+    const requestType = ["current_state", "scenario", "comparison", "instruction", "general"].includes(raw.requestType)
+      ? raw.requestType
+      : "current_state";
+    const scopeType = ["facility", "transport_network", "route", "inventory", "unknown"].includes(raw.scopeType)
+      ? raw.scopeType
+      : "unknown";
+    const affectedFlow = ["inbound", "outbound", "all"].includes(raw.affectedFlow) ? raw.affectedFlow : "all";
+    const intent = requestType === "scenario"
+      ? "scenario_simulation"
+      : (Object.values(TOOL_TO_INTENT).includes(raw.intent) || raw.intent === "general_question" || raw.intent === "unavailable")
+        ? raw.intent
+        : "general_question";
+    return {
+      requestType,
+      intent,
+      event: typeof raw.event === "string" && raw.event.trim() ? raw.event.trim() : null,
+      scope: typeof raw.scope === "string" && raw.scope.trim() ? raw.scope.trim() : null,
+      scopeType,
+      leadTimeMinutes: finitePositiveOrNull(raw.leadTimeMinutes),
+      durationMinutes: finitePositiveOrNull(raw.durationMinutes),
+      affectedFlow,
+      affectedDomains: Array.isArray(raw.affectedDomains) ? raw.affectedDomains.map(String).slice(0, 8) : [],
+      requestedOutcomes: Array.isArray(raw.requestedOutcomes) ? raw.requestedOutcomes.map(String).slice(0, 8) : [],
+      explicitReferences: Array.isArray(raw.explicitReferences) ? raw.explicitReferences.map(String).slice(0, 12) : [],
+      missingInputs: Array.isArray(raw.missingInputs) ? raw.missingInputs.map(String).slice(0, 8) : []
+    };
+  } catch (error) {
+    markOpenAiUnavailable(error);
+    console.warn("Semantic request planning failed; tool selection will continue without a semantic plan.", error);
+    return null;
+  }
+}
+
 function priorityLabel(priority: AnalysisPriority) {
   if (priority === "fefo") return "FEFO first";
   if (priority === "cold_chain") return "Cold-chain first";
@@ -104,6 +204,14 @@ const AGENT_TOOL_SPECS = [
     function: {
       name: "get_inventory_summary",
       description: "Get the current on-hand, available, reserved, incoming, outbound, and QA Hold totals across the whole warehouse.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "get_warehouse_capacity",
+      description: "Get current warehouse space utilisation: total capacity, occupied units, available capacity, overall fill percentage, and per-zone occupancy. Use for fullness, free-space, occupancy, storage-capacity, and warehouse-utilisation questions.",
       parameters: { type: "object", properties: {}, additionalProperties: false }
     }
   },
@@ -343,13 +451,29 @@ const AGENT_TOOL_SPECS = [
   {
     type: "function" as const,
     function: {
+      name: "get_operational_alerts",
+      description: "Read current or historical operational alerts across inventory, quality, temperature, docks, and logistics. Use this for alert counts, severity breakdowns, alert lists, and alert-status questions.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: { type: "string", enum: ["open", "dismissed", "all"], description: "Alert status to return. Defaults to open." },
+          severity: { type: "string", enum: ["critical", "warn", "info", "all"], description: "Optional severity filter." }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
       name: "check_dock_schedule",
-      description: "Check for dock slot conflicts and availability within a time window.",
+      description: "Read dock status, scheduled appointments, conflicts, and availability within a time window, optionally for one dock.",
       parameters: {
         type: "object",
         properties: {
           timeWindow: { type: "string", description: "Time window to check, e.g. 'next 4 hours' or 'next 12 hours'. Defaults to next 4 hours." },
-          shipmentId: { type: "string", description: "Optional shipment ID to check against the schedule." }
+          shipmentId: { type: "string", description: "Optional shipment ID to check against the schedule." },
+          dockId: { type: "string", description: "Optional dock ID or spoken dock number, e.g. D1 or Dock 1." }
         },
         additionalProperties: false
       }
@@ -372,18 +496,17 @@ const AGENT_TOOL_SPECS = [
     type: "function" as const,
     function: {
       name: "simulate_facility_disruption",
-      description: "Simulate (without mutating state) a warehouse-wide outage such as a tornado, flood, earthquake, power outage, or closure. Evaluates FEFO expiry exposure and all inbound/outbound work during the outage without assuming a transport route.",
+      description: "Simulate (without mutating state) any external event or operational disruption that may affect the warehouse or its connected transport network. The event may be expressed in ordinary language. Separates warning time from disruption duration and reports missing duration or scope instead of inventing it.",
       parameters: {
         type: "object",
         properties: {
-          eventType: {
-            type: "string",
-            enum: ["severe_weather", "facility_shutdown", "tornado", "flood", "earthquake", "power_outage"],
-            description: "Facility disruption type."
-          },
-          durationMinutes: { type: "number", description: "Full facility downtime in minutes, e.g. 10080 for one week." }
+          eventType: { type: "string", description: "The event in the operator's own terms, e.g. tsunami, cyberattack, labour disruption, severe weather, access restriction, or power outage." },
+          scope: { type: "string", description: "Affected place or operational scope stated by the operator. Do not invent a more specific facility." },
+          leadTimeMinutes: { type: "number", description: "Time until the event begins. This is not the disruption duration." },
+          durationMinutes: { type: "number", description: "Expected operational disruption duration, only when explicitly provided." },
+          affectedFlow: { type: "string", enum: ["inbound", "outbound", "all"], description: "Flow the operator asks about." }
         },
-        required: ["eventType", "durationMinutes"],
+        required: ["eventType"],
         additionalProperties: false
       }
     }
@@ -433,6 +556,7 @@ const AGENT_TOOL_SPECS = [
 
 const TOOL_TO_AGENTS: Record<string, AgentName[]> = {
   get_inventory_summary: ["Inventory"],
+  get_warehouse_capacity: ["Inventory"],
   search_inventory: ["Inventory"],
   get_product_stock: ["Inventory"],
   get_inventory_planning: ["Inventory"],
@@ -449,6 +573,7 @@ const TOOL_TO_AGENTS: Record<string, AgentName[]> = {
   get_route_status: ["Logistics"],
   get_transport_context: ["Logistics", "Inventory"],
   get_audit_lookup: ["Compliance"],
+  get_operational_alerts: ["Inventory", "Logistics", "Compliance"],
   check_dock_schedule: ["Logistics"],
   simulate_reprioritisation: ["Inventory", "Logistics", "Compliance"],
   simulate_facility_disruption: ["Inventory", "Logistics", "Compliance"],
@@ -462,6 +587,7 @@ const TOOL_TO_INTENT: Record<string, AgentIntent> = {
   check_fefo_allocation: "fefo_check",
   simulate_shipment_allocation: "stock_position",
   get_inventory_summary: "stock_position",
+  get_warehouse_capacity: "general_question",
   search_inventory: "stock_position",
   get_product_stock: "stock_position",
   get_inventory_planning: "stock_position",
@@ -475,6 +601,7 @@ const TOOL_TO_INTENT: Record<string, AgentIntent> = {
   get_transport_context: "transport_status",
   check_dock_schedule: "route_status",
   get_audit_lookup: "audit_lookup",
+  get_operational_alerts: "general_question",
   simulate_reprioritisation: "scenario_simulation",
   simulate_facility_disruption: "scenario_simulation",
   simulate_event_impact: "shipment_impact",
@@ -489,6 +616,26 @@ function guessIntentFromExecutions(executions: ToolExecution[]): AgentIntent {
     if (intent) return intent;
   }
   return "general_question";
+}
+
+function resolveIntentFromVerifiedOutputs(
+  query: string,
+  routedIntent: AgentIntent,
+  executions: ToolExecution[],
+  semanticPlan?: SemanticRequestPlan | null
+): AgentIntent {
+  const names = new Set(executions.map((execution) => execution.name));
+  if (semanticPlan?.requestType === "scenario" || names.has("simulate_facility_disruption") || names.has("simulate_transport_impact") || names.has("simulate_reprioritisation")) {
+    return "scenario_simulation";
+  }
+  if (names.has("locate_sku") && extractSku(query)?.startsWith("STK-")) return "sku_location";
+  if (names.has("check_dock_schedule")) return "route_status";
+  if (names.has("check_cold_chain_status") || names.has("get_temperature_events")) {
+    return routedIntent === "non_conformance" ? routedIntent : "temperature_event";
+  }
+  if (names.has("get_warehouse_capacity")) return "general_question";
+  if (names.has("get_operational_alerts")) return "general_question";
+  return routedIntent;
 }
 
 function agentsFromExecutions(executions: ToolExecution[]): AgentName[] {
@@ -516,14 +663,17 @@ async function selectAndRunToolsWithAgent(
   onProgress?: ProgressCallback,
   analysisPriority: AnalysisPriority = "balanced",
   uiContext?: AssistantUiContext
-): Promise<{ executions: ToolExecution[]; toolFailures: string[] }> {
+): Promise<{ executions: ToolExecution[]; toolFailures: string[]; semanticPlan: SemanticRequestPlan | null }> {
   const executions: ToolExecution[] = [];
   const toolFailures: string[] = [];
+  if (Date.now() < openAiUnavailableUntil) throw new Error("Semantic model authentication is unavailable; use the resilient local scenario planner.");
+  const semanticPlan = await interpretRequestWithAgent(client, model, query, uiContext);
+  if (Date.now() < openAiUnavailableUntil) throw new Error("Semantic model authentication is unavailable; use the resilient local scenario planner.");
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: TWINOPS_TOOL_ROUTER_SYSTEM_PROMPT },
     {
       role: "user",
-      content: `Analysis priority: ${priorityLabel(analysisPriority)}. ${priorityInstruction(analysisPriority)}\n\n${uiContextPrompt(uiContext)}\n\nOperator request: ${query}`
+      content: `Analysis priority: ${priorityLabel(analysisPriority)}. ${priorityInstruction(analysisPriority)}\n\nSemantic request plan: ${JSON.stringify(semanticPlan)}\nUse the semantic plan to choose tools, but use tool output—not the plan—for operational facts. Every requested outcome must be addressed or identified as a data gap.\n\n${uiContextPrompt(uiContext)}\n\nOperator request: ${query}`
     }
   ];
 
@@ -563,14 +713,14 @@ async function selectAndRunToolsWithAgent(
 
   const stockBalanceId = extractSku(query);
   const executionNames = new Set(executions.map((execution) => execution.name));
-  if (isFacilityDisruptionQuery(query)) {
-    for (let index = executions.length - 1; index >= 0; index -= 1) {
-      if (["simulate_event_impact", "simulate_transport_impact"].includes(executions[index].name)) executions.splice(index, 1);
-    }
-    executionNames.clear();
-    for (const execution of executions) executionNames.add(execution.name);
-    if (!executionNames.has("simulate_facility_disruption")) {
-      const input = { eventType: normaliseFacilityEventType(query), durationMinutes: extractFacilityDurationMinutes(query) };
+  if (semanticPlan?.requestType === "scenario" && semanticPlan.event && !executionNames.has("simulate_facility_disruption") && !executionNames.has("simulate_transport_impact")) {
+    const input = {
+      eventType: semanticPlan.event,
+      scope: semanticPlan.scope ?? undefined,
+      leadTimeMinutes: semanticPlan.leadTimeMinutes ?? undefined,
+      durationMinutes: semanticPlan.durationMinutes ?? undefined,
+      affectedFlow: semanticPlan.affectedFlow
+    };
       try {
         const output = await runTool("simulate_facility_disruption", input);
         executions.push({ name: "simulate_facility_disruption", input, output, summary: summariseToolCall("simulate_facility_disruption", input, output) });
@@ -580,7 +730,6 @@ async function selectAndRunToolsWithAgent(
         const errorMessage = error instanceof Error ? error.message : "Tool execution failed.";
         toolFailures.push(`simulate_facility_disruption: ${errorMessage}`);
       }
-    }
   }
   for (const referenceId of extractTransportReferences(query)) {
     if (hasToolExecution(executions, "get_transport_context", "referenceId", referenceId)) continue;
@@ -643,7 +792,7 @@ async function selectAndRunToolsWithAgent(
     }
   }
 
-  return { executions, toolFailures };
+  return { executions, toolFailures, semanticPlan };
 }
 
 function extractSku(query: string) {
@@ -696,8 +845,13 @@ function extractTransportReference(query: string) {
 
 function extractTransportReferences(query: string) {
   const references = query.match(/\b(?:LEG-(?:IN|OUT)-[A-Z0-9-]+|APT-(?:IN|OUT)-[A-Z0-9-]+|ASN-[A-Z0-9-]+|SHIP-[A-Z0-9-]+|ROUTE-[A-Z0-9-]+)\b/gi) ?? [];
-  const docks = [...query.matchAll(/\bdock\s+(D\d+)\b/gi)].map((match) => match[1]);
+  const docks = [...query.matchAll(/\bdock\s+(D?\s*\d+)\b/gi)].map((match) => `D${Number(match[1].replace(/\D/g, ""))}`);
   return [...new Set([...references, ...docks].map((reference) => reference.toUpperCase()))];
+}
+
+function extractDockReference(query: string) {
+  const match = query.match(/\bdock\s+(?:d\s*)?(\d+)\b/i);
+  return match ? `D${Number(match[1])}` : undefined;
 }
 
 function extractStockReferences(query: string) {
@@ -731,31 +885,85 @@ function normaliseEventType(query: string) {
   return "traffic_delay";
 }
 
-function isFacilityDisruptionQuery(query: string) {
-  const facility = /\b(?:singapore\s+western\s+dc|western\s+dc|warehouse|facility|distribution\s+cent(?:re|er)|dc)\b/i.test(query);
-  const disruption = /\b(?:tornado|hurricane|typhoon|cyclone|earthquake|flood(?:ing)?|power\s+outage|shutdown|shut\s+down|clos(?:e|ed|ure)|inaccessible|down\s+for)\b/i.test(query);
-  return facility && disruption;
-}
-
-function extractFacilityDurationMinutes(query: string) {
-  const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4 };
-  const match = query.match(/\b(\d+(?:\.\d+)?|one|two|three|four)\s*(years?|yrs?|weeks?|days?|hours?|hrs?|minutes?|mins?)\b/i);
-  if (!match) return 7 * 24 * 60;
-  const value = Number(match[1]) || words[match[1].toLowerCase()] || 1;
-  if (/^(?:year|yr)/i.test(match[2])) return Math.round(value * 365 * 24 * 60);
-  if (/^week/i.test(match[2])) return Math.round(value * 7 * 24 * 60);
-  if (/^day/i.test(match[2])) return Math.round(value * 24 * 60);
-  if (/^(?:hour|hr)/i.test(match[2])) return Math.round(value * 60);
+function durationPhraseToMinutes(valueInput: string, unit: string) {
+  const words: Record<string, number> = {
+    a: 1,
+    an: 1,
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12
+  };
+  const value = Number(valueInput) || words[valueInput.toLowerCase()] || 0;
+  if (!value) return null;
+  if (/^(?:year|yr)/i.test(unit)) return Math.round(value * 365 * 24 * 60);
+  if (/^week/i.test(unit)) return Math.round(value * 7 * 24 * 60);
+  if (/^day/i.test(unit)) return Math.round(value * 24 * 60);
+  if (/^(?:hour|hr)/i.test(unit)) return Math.round(value * 60);
   return Math.round(value);
 }
 
-function normaliseFacilityEventType(query: string) {
-  const text = query.toLowerCase();
-  if (text.includes("tornado") || text.includes("hurricane") || text.includes("typhoon") || text.includes("cyclone")) return "severe_weather";
-  if (text.includes("flood")) return "flood";
-  if (text.includes("earthquake")) return "earthquake";
-  if (text.includes("power outage")) return "power_outage";
-  return "facility_shutdown";
+/**
+ * Resilient no-model fallback. It recognises the grammatical shape of a scenario rather
+ * than maintaining a list of disasters or operational events. The LLM semantic planner is
+ * the primary path; this keeps arbitrary "what happens if/when" requests safe when it is down.
+ */
+export function scenarioPlanFromLanguage(query: string): SemanticRequestPlan | null {
+  const scenarioSignal = /\b(?:what\s+(?:if|will|would|is\s+going\s+to)|what'?s\s+going\s+to|how\s+(?:will|would)|impact|affect|effect|consequence|scenario|expected\s+to)\b/i.test(query)
+    || /\b(?:is|are)\s+(?:going|expected|likely|set)\s+to\s+(?:hit|strike|affect|disrupt|impact|reach)\b/i.test(query)
+    || /\bwill\s+(?:hit|strike|affect|disrupt|impact|reach)\b/i.test(query);
+  if (!scenarioSignal) return null;
+
+  const timePattern = "(\\d+(?:\\.\\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\\s*(years?|yrs?|weeks?|days?|hours?|hrs?|minutes?|mins?)";
+  const durationMatch = query.match(new RegExp(`\\b(?:down|clos(?:e|ed)|unavailable|inaccessible|disrupted|delayed|out|offline|paused|shut(?:down)?)\\s+for\\s+${timePattern}\\b`, "i"));
+  const leadMatch = query.match(new RegExp(`\\b(?:in|within)\\s+${timePattern}\\b`, "i"));
+  const durationMinutes = durationMatch ? durationPhraseToMinutes(durationMatch[1], durationMatch[2]) : null;
+  const leadTimeMinutes = leadMatch ? durationPhraseToMinutes(leadMatch[1], leadMatch[2]) : null;
+
+  const becauseEvent = query.match(/\bbecause\s+of\s+([^,;—]+?)(?=\s+while\b|\s+and\b|[,.?;—]|$)/i)?.[1];
+  const futureEvent = query.match(/^\s*(?:what\s+if\s+)?(?:an?\s+|the\s+)?(.+?)\s+(?:is|are)\s+(?:going|expected|likely|set)\s+to\s+(?:hit|strike|affect|disrupt|impact|reach)\b/i)?.[1]
+    ?? query.match(/^\s*(?:what\s+if\s+)?(?:an?\s+|the\s+)?(.+?)\s+will\s+(?:hit|strike|affect|disrupt|impact|reach)\b/i)?.[1];
+  const leadingEvent = query.match(/^\s*(?:what\s+if\s+)?(?:an?\s+|the\s+)?(.+?)\s+(?:is|are|will|would)\s+(?:hitting|striking|affecting|disrupting|approaching)\b/i)?.[1];
+  const event = (becauseEvent ?? futureEvent ?? leadingEvent ?? "external operational disruption").trim();
+
+  const operationalScope = query.match(/(?:^|[,;.])\s*(?:my|our|the)\s+([^,;.?]+?)\s+(?:is|are|will|would)\s+(?:(?:going|expected|likely|set|forced)\s+to\s+)?(?:go(?:ing)?\s+down|be\s+down|down|shut(?:ting)?\s+down|be\s+clos(?:ed|ing)|clos(?:e|ed|ing)|be\s+unavailable|be\s+inaccessible|be\s+offline)\b/i)?.[1];
+
+  const hittingScope = query.match(/\b(?:hitting|striking|affecting)\s+(.+?)(?=\s+(?:in|within)\s+\d|[,;—?]|$)/i)?.[1];
+  const subjectScope = query.match(/^\s*(?:what\s+if\s+)?(.+?)\s+(?:is|will\s+be|would\s+be)\s+(?:forced|expected|closed|unavailable|inaccessible|disrupted)\b/i)?.[1];
+  const futureEventScope = query.match(/\b(?:hit|strike|affect|disrupt|impact|reach)\s+([^,;.?]+?)(?=\s+(?:in|within)\s+(?:\d|a\b|an\b|one\b)|[,;.?]|$)/i)?.[1];
+  const scope = (operationalScope ?? futureEventScope ?? hittingScope ?? subjectScope)?.trim() || null;
+  const affectedFlow = /\boutbound\b/i.test(query) && !/\binbound\b/i.test(query)
+    ? "outbound"
+    : /\binbound\b/i.test(query) && !/\boutbound\b/i.test(query)
+      ? "inbound"
+      : "all";
+  const explicitReferences = [...new Set([...extractTransportReferences(query), ...extractStockReferences(query)])];
+
+  return {
+    requestType: "scenario",
+    intent: "scenario_simulation",
+    event,
+    scope,
+    scopeType: scope && /\b(?:dc|distribution\s+cent(?:re|er)|warehouse|facility|site)\b/i.test(scope) ? "facility" : scope ? "transport_network" : "unknown",
+    leadTimeMinutes,
+    durationMinutes,
+    affectedFlow,
+    affectedDomains: [affectedFlow === "all" ? "warehouse operations" : affectedFlow],
+    requestedOutcomes: ["Operational consequences and exposed work"],
+    explicitReferences,
+    missingInputs: [
+      ...(durationMinutes === null ? ["Expected disruption duration"] : []),
+      ...(scope === null ? ["Affected facility or network scope"] : [])
+    ]
+  };
 }
 
 function extractTransportSearchReference(query: string) {
@@ -797,6 +1005,16 @@ function hasExplicitZone(query: string) {
   return ["cold", "ambient", "pharmaceutical", "receiving", "dispatch", "qa", "quarantine"].some((zone) => text.includes(zone));
 }
 
+function requestsTemperatureHistory(query: string) {
+  return /\b(?:event|events|excursion|non[- ]?conformance|history|historical|past|previous|trend|peak|duration)\b/i.test(query);
+}
+
+function requestsWarehouseCapacity(query: string) {
+  const hasFacilityScope = /\b(?:warehouse|facility|storage|space|locations?|bins?|racks?)\b/i.test(query);
+  const hasCapacityMeaning = /\b(?:full|fullness|capacity|space|room|occupancy|occupied|utili[sz](?:ation|ed)|free|remaining|available)\b/i.test(query);
+  return hasFacilityScope && hasCapacityMeaning;
+}
+
 function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; intent: AgentIntent } {
   const text = query.toLowerCase();
   const skuId = extractSku(query);
@@ -814,13 +1032,42 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
     return { agents: [...agents], tools, intent: "audit_lookup" };
   }
 
-  if (isFacilityDisruptionQuery(query)) {
+  if (/\balerts?\b/i.test(query)) {
+    agents.add("Inventory");
+    agents.add("Logistics");
+    agents.add("Compliance");
+    tools.push({
+      name: "get_operational_alerts",
+      input: {
+        status: /\b(?:all|history|historical|dismissed|closed)\b/i.test(query) ? "all" : "open",
+        severity: /\bcritical\b/i.test(query) ? "critical" : /\bwarn(?:ing)?s?\b/i.test(query) ? "warn" : /\binfo(?:rmational)?\b/i.test(query) ? "info" : undefined
+      }
+    });
+    return { agents: [...agents], tools, intent: "general_question" };
+  }
+
+  if (requestsWarehouseCapacity(query)) {
+    agents.add("Inventory");
+    tools.push({ name: "get_warehouse_capacity", input: {} });
+    return { agents: [...agents], tools, intent: "general_question" };
+  }
+
+  const languageScenario = scenarioPlanFromLanguage(query);
+  const exactScenarioReference = extractTransportReference(query);
+  const isSingleTransportScenario = Boolean(exactScenarioReference && extractTransportReferences(query).length === 1 && /\b(?:transport|route|leg|asn|shipment|appointment)\b/i.test(query));
+  if (languageScenario && !isSingleTransportScenario) {
     agents.add("Inventory");
     agents.add("Logistics");
     agents.add("Compliance");
     tools.push({
       name: "simulate_facility_disruption",
-      input: { eventType: normaliseFacilityEventType(query), durationMinutes: extractFacilityDurationMinutes(query) }
+      input: {
+        eventType: languageScenario.event ?? "external operational disruption",
+        scope: languageScenario.scope ?? undefined,
+        leadTimeMinutes: languageScenario.leadTimeMinutes ?? undefined,
+        durationMinutes: languageScenario.durationMinutes ?? undefined,
+        affectedFlow: languageScenario.affectedFlow
+      }
     });
     for (const referenceId of extractTransportReferences(query)) {
       tools.push({ name: "get_transport_context", input: { referenceId } });
@@ -915,9 +1162,28 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
   if (text.includes("temperature") || text.includes("cold-chain") || text.includes("cold chain")) {
     agents.add("Compliance");
     agents.add("Inventory");
-    tools.push({ name: "get_temperature_events", input: { zoneId: extractZone(query) } });
+    if (requestsTemperatureHistory(query)) tools.push({ name: "get_temperature_events", input: { zoneId: extractZone(query) } });
     tools.push({ name: "check_cold_chain_status", input: { zoneId: extractZone(query), skuId } });
     return { agents: [...agents], tools, intent: "temperature_event" };
+  }
+
+  const dockReference = extractDockReference(query);
+  if (
+    text.includes("dock conflict")
+    || text.includes("dock conflicts")
+    || text.includes("dock schedule")
+    || Boolean(dockReference && /\b(?:schedule|appointment|booking|available|availability|occupied|status|utili[sz]ation)\b/i.test(query))
+  ) {
+    agents.add("Logistics");
+    tools.push({
+      name: "check_dock_schedule",
+      input: {
+        timeWindow: text.includes("12") ? "next 12 hours" : dockReference ? "next 12 hours" : "next 4 hours",
+        shipmentId,
+        dockId: dockReference
+      }
+    });
+    return { agents: [...agents], tools, intent: "route_status" };
   }
 
   if (
@@ -979,7 +1245,7 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
       tools.push({ name: "get_inventory_summary", input: {} });
       tools.push({ name: "search_inventory", input: { query } });
     }
-    if (skuId?.startsWith("STK-") && text.includes("impact")) return { agents: [...agents], tools, intent: "sku_location" };
+    if (skuId?.startsWith("STK-")) return { agents: [...agents], tools, intent: "sku_location" };
     if (text.includes("incoming")) return { agents: [...agents], tools, intent: "incoming_stock" };
     if (text.includes("outbound")) return { agents: [...agents], tools, intent: "outbound_stock" };
     if (text.includes("fefo")) return { agents: [...agents], tools, intent: "fefo_check" };
@@ -1007,12 +1273,6 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
     return { agents: [...agents], tools, intent: "transport_status" };
   }
 
-  if (text.includes("dock conflict") || text.includes("dock conflicts") || text.includes("dock schedule")) {
-    agents.add("Logistics");
-    tools.push({ name: "check_dock_schedule", input: { timeWindow: text.includes("12") ? "next 12 hours" : "next 4 hours", shipmentId } });
-    return { agents: [...agents], tools, intent: "route_status" };
-  }
-
   if (skuId) {
     agents.add("Inventory");
     tools.push({ name: "locate_sku", input: { stockBalanceId: skuId } });
@@ -1023,8 +1283,6 @@ function routeQuery(query: string): { agents: AgentName[]; tools: ToolPlan[]; in
     return { agents: [...agents], tools, intent: skuId.startsWith("LOT-") || skuId.startsWith("SB-LOT-") ? "batch_detail" : "sku_location" };
   }
 
-  tools.push({ name: "check_dock_schedule", input: { timeWindow: "next 4 hours" } });
-  agents.add("Logistics");
   return { agents: [...agents], tools, intent: "general_question" };
 }
 
@@ -1090,23 +1348,44 @@ function matchingExecution(executions: ToolExecution[], name: string, inputKey: 
 }
 
 function facilityScenarioPresentation(query: string, executions: ToolExecution[], simulation: any) {
-  const durationDays = simulation.durationMinutes / (24 * 60);
-  const durationLabel = durationDays % 365 === 0
-    ? `${durationDays / 365}-year`
-    : `${Number.isInteger(durationDays) ? String(durationDays) : durationDays.toFixed(1)}-day`;
-  const durationFact = durationDays % 365 === 0
-    ? `${durationDays / 365} year${durationDays === 365 ? "" : "s"} (${durationDays} days)`
-    : `${Number.isInteger(durationDays) ? String(durationDays) : durationDays.toFixed(1)} days`;
-  const facts: AgentResponse["facts"] = [
-    { label: "Facility scope", value: simulation.scope },
-    { label: "Outage duration", value: durationFact },
-    {
-      label: "FEFO exposure",
-      value: `${simulation.expiresDuringOutage.length} lots / ${simulation.expiresDuringOutageUnits} units during; ${simulation.expiresWithin7DaysAfterRecovery.length} lots / ${simulation.restartCriticalUnits} units after recovery`
-    }
-  ];
+  const durationKnown = simulation.durationKnown !== false && Number(simulation.durationMinutes) > 0;
+  const durationDays = durationKnown ? simulation.durationMinutes / (24 * 60) : null;
+  const durationLabel = durationKnown
+    ? durationDays! % 365 === 0
+      ? `${durationDays! / 365}-year`
+      : `${Number.isInteger(durationDays) ? String(durationDays) : durationDays!.toFixed(1)}-day`
+    : `${simulation.leadTimeMinutes || 0}-minute warning`;
+  const durationFact = durationKnown
+    ? durationDays! % 365 === 0
+      ? `${durationDays! / 365} year${durationDays === 365 ? "" : "s"} (${durationDays} days)`
+      : `${Number.isInteger(durationDays) ? String(durationDays) : durationDays!.toFixed(1)} days`
+    : "Unavailable; no downtime assumed";
+  const eventLabel = String(simulation.eventType ?? "external disruption").replaceAll("_", " ");
+  const scopeLabel = String(simulation.scope ?? "Scope not specified")
+    .replace(/^./, (character) => character.toUpperCase())
+    .replace(/\bdc\b/gi, "DC");
+  const facts: AgentResponse["facts"] = durationKnown
+    ? [
+        { label: "Scenario event", value: eventLabel },
+        { label: "Facility scope", value: scopeLabel },
+        { label: "Outage duration", value: durationFact },
+        {
+          label: "FEFO exposure",
+          value: `${simulation.expiresDuringOutage.length} lots / ${simulation.expiresDuringOutageUnits} units during; ${simulation.expiresWithin7DaysAfterRecovery.length} lots / ${simulation.restartCriticalUnits} units after recovery`
+        }
+      ]
+    : [
+        { label: "Scenario event", value: eventLabel },
+        { label: "Stated scope", value: scopeLabel },
+        { label: "Warning time", value: `${simulation.leadTimeMinutes || 0} minutes` },
+        { label: "Disruption duration", value: durationFact },
+        { label: "Outbound exposure", value: `${simulation.outboundAffected.length} open movement(s) at event onset` },
+        { label: "Verified data scope", value: simulation.dataScope }
+      ];
   const impacts: string[] = [];
-  const dataGaps = ["Backup power, alternate-site capacity, and post-event stock-condition evidence were not provided."];
+  const dataGaps = Array.isArray(simulation.dataGaps)
+    ? [...simulation.dataGaps]
+    : ["Backup power, alternate-site capacity, and post-event stock-condition evidence were not provided."];
 
   const stockReferences = extractStockReferences(query);
   for (const reference of stockReferences) {
@@ -1162,13 +1441,185 @@ function facilityScenarioPresentation(query: string, executions: ToolExecution[]
         : `${outboundRecords.map((record) => record.referenceId).join(", ")} cannot be picked, staged, or dispatched during the closure.`
     );
   }
-  impacts.push(`Across the outage window, ${simulation.inboundAffected.length} inbound and ${simulation.outboundAffected.length} outbound movement(s) require replanning before FEFO allocation resumes.`);
+  if (durationKnown) {
+    impacts.push(`Across the outage window, ${simulation.inboundAffected.length} inbound and ${simulation.outboundAffected.length} outbound movement(s) require replanning before FEFO allocation resumes.`);
+  } else {
+    impacts.push(...simulation.operationalImpact);
+  }
+
+  const summary = durationKnown
+    ? `The ${eventLabel} scenario causes a ${durationLabel} shutdown of ${scopeLabel}, pausing FEFO execution across the warehouse; ${simulation.expiresDuringOutage.length} released lot(s) expire during the outage and ${simulation.expiresWithin7DaysAfterRecovery.length} expire within seven days after recovery.`
+    : `${eventLabel} is expected to affect ${scopeLabel} in ${simulation.leadTimeMinutes || 0} minutes; ${simulation.outboundAffected.length} open outbound movement(s) are exposed, but disruption duration and physical impact are not yet verified.`;
 
   return {
     durationLabel,
+    title: durationKnown ? "Facility FEFO Scenario" : "External Hazard Scenario",
+    summary,
     facts: facts.slice(0, 8),
     impacts: [...new Set(impacts)].slice(0, 5),
     dataGaps: [...new Set(dataGaps)].slice(0, 4)
+  };
+}
+
+function singaporeDateTime(value: string | null | undefined) {
+  if (!value) return "Unavailable";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en-SG", {
+    timeZone: "Asia/Singapore",
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function stockLocationResponse(located: any, fefo?: any): AgentResponse {
+  const expired = new Date(located.expiryDate).getTime() <= Date.now();
+  const restricted = located.qualityReleaseStatus !== "Released" || expired;
+  const location = `${located.zone?.name ?? "Unknown zone"}, Rack ${located.rack}, Bin ${located.bin}`;
+  const traceabilityGaps = [
+    !located.stoNumber ? "STO is unavailable for this stock record." : null,
+    !located.lotCode && !located.batchNo ? "Lot is unavailable for this stock record." : null
+  ].filter((value): value is string => Boolean(value));
+  return {
+    intent: "sku_location",
+    status: restricted ? "blocked" : "ok",
+    title: "Stock Item Details",
+    summary: `${located.stockBalanceId} is in ${location}. Lot ${located.lotCode ?? located.batchNo ?? "Unavailable"} is ${located.qualityReleaseStatus}${expired ? " and expired" : ""}, with expiry ${singaporeDateTime(located.expiryDate)}.`,
+    facts: [
+      { label: "Stock balance", value: located.stockBalanceId },
+      { label: "Product", value: `${located.productCode ?? "Unavailable"}${located.productName ? ` · ${located.productName}` : ""}` },
+      { label: "Lot / batch", value: located.lotCode ?? located.batchNo ?? "Unavailable" },
+      { label: "STO", value: located.stoNumber ?? "Unavailable" },
+      { label: "Expiry", value: singaporeDateTime(located.expiryDate) },
+      { label: "Quality status", value: located.qualityReleaseStatus ?? "Unavailable" },
+      { label: "Location", value: location },
+      { label: "Quantity", value: `${located.quantity} on hand; ${located.quantityAvailable} available` }
+    ],
+    impact: [
+      restricted
+        ? "This stock is not eligible for allocation until its quality and expiry restrictions are resolved through the controlled workflow."
+        : "The stock is quality-released; FEFO sequence and shipment allocation still determine whether it should be consumed next.",
+      fefo
+        ? `FEFO verification found ${fefo.totalEligibleAvailable ?? fefo.remainingAvailable ?? 0} eligible units and ${fefo.fefoViolationCount ?? 0} sequencing violation(s).`
+        : `It is currently linked to ${located.linkedShipmentId ?? "no active shipment"} at stage ${located.currentStage}.`
+    ],
+    nextAction: { label: "Locate in Warehouse", type: "locate_warehouse", targetId: located.stockBalanceId },
+    requiresApproval: false,
+    dataGaps: traceabilityGaps,
+    confidence: traceabilityGaps.length ? "medium" : "high"
+  };
+}
+
+function dockScheduleResponse(schedule: any): AgentResponse {
+  const dock = schedule.dockState;
+  const appointments = Array.isArray(schedule.scheduledAppointments) ? schedule.scheduledAppointments : [];
+  const dockLabel = dock?.name ?? schedule.dockId ?? "Dock network";
+  const appointmentSummary = appointments.slice(0, 4).map((appointment: any) =>
+    `${appointment.id}: ${appointment.shipmentId} · ${appointment.status} · ${singaporeDateTime(appointment.startTime)} to ${singaporeDateTime(appointment.endTime)}`
+  ).join("; ") || "No active or upcoming appointments in the checked window";
+  const conflicts = schedule.dockSlotConflicts?.length ?? 0;
+  return {
+    intent: "route_status",
+    status: conflicts > 0 || dock?.status === "maintenance" ? "attention" : "ok",
+    title: `${dockLabel} Schedule`,
+    summary: `${dockLabel} is ${dock?.status ?? "checked"}${dock?.currentShipmentId ? ` with ${dock.currentShipmentId}` : ""}. ${appointments.length} active or upcoming appointment(s) are scheduled in the ${schedule.timeWindow} window; ${conflicts} conflict(s) were found.`,
+    facts: [
+      { label: "Dock", value: `${schedule.dockId ?? "All docks"}${dock?.status ? ` · ${dock.status}` : ""}` },
+      { label: "Current movement", value: dock?.currentShipmentId ?? "None" },
+      { label: "Next available", value: singaporeDateTime(dock?.nextAvailableAt) },
+      { label: "Appointments", value: appointmentSummary },
+      { label: "Schedule conflicts", value: String(conflicts) }
+    ],
+    impact: [
+      conflicts > 0
+        ? "The overlapping dock commitments require operator review before another movement is assigned."
+        : "No overlapping appointment conflict was found for the checked dock and time window."
+    ],
+    nextAction: { label: "Open Logistics", type: "open_logistics", targetId: dock?.currentShipmentId ?? null },
+    requiresApproval: false,
+    dataGaps: [],
+    confidence: "high"
+  };
+}
+
+function currentTemperatureResponse(cold: any): AgentResponse {
+  const inBand = cold.breachSeverity === "none";
+  return {
+    intent: "temperature_event",
+    status: inBand ? "ok" : "attention",
+    title: "Current Temperature",
+    summary: `${cold.zoneName} is currently ${cold.currentTemperature} °C against its required ${cold.requiredMin}-${cold.requiredMax} °C band; the current reading is ${inBand ? "within range" : `${cold.breachSeverity} out of range`}.`,
+    facts: [
+      { label: "Zone", value: cold.zoneName },
+      { label: "Current temperature", value: `${cold.currentTemperature} °C` },
+      { label: "Required band", value: `${cold.requiredMin}-${cold.requiredMax} °C` },
+      { label: "Current condition", value: inBand ? "Within range" : `${cold.breachSeverity} breach` },
+      { label: "Time in current breach", value: `${cold.timeInBreachMinutes} minutes` },
+      { label: "Stock in zone", value: `${cold.affectedSkus.length} stock balance(s)` }
+    ],
+    impact: [cold.recommendedMitigation],
+    nextAction: { label: "Open Monitoring", type: "open_monitoring", targetId: cold.zoneId },
+    requiresApproval: false,
+    dataGaps: [],
+    confidence: "high"
+  };
+}
+
+function operationalAlertsResponse(result: any): AgentResponse {
+  const count = Number(result.alertCount ?? 0);
+  const severities = result.countBySeverity ?? { critical: 0, warn: 0, info: 0 };
+  const sources = Object.entries(result.countBySource ?? {}).map(([source, value]) => `${source}: ${value}`).join("; ") || "None";
+  return {
+    intent: "general_question",
+    status: count > 0 ? "attention" : "ok",
+    title: "Operational Alerts",
+    summary: `There ${count === 1 ? "is" : "are"} ${count} ${result.statusFilter} operational alert${count === 1 ? "" : "s"}: ${severities.critical} critical, ${severities.warn} warning, and ${severities.info} informational.`,
+    facts: [
+      { label: `${String(result.statusFilter).replace(/^./, (value: string) => value.toUpperCase())} alerts`, value: String(count) },
+      { label: "Critical", value: String(severities.critical) },
+      { label: "Warning", value: String(severities.warn) },
+      { label: "Informational", value: String(severities.info) },
+      { label: "By source", value: sources }
+    ],
+    impact: count > 0
+      ? result.alerts.slice(0, 3).map((alert: any) => `${alert.severity.toUpperCase()}: ${alert.message}`)
+      : ["No open operational alert requires review."],
+    nextAction: count > 0 ? { label: "Open Alerts", type: "open_alerts", targetId: null } : { label: "No Action", type: "none", targetId: null },
+    requiresApproval: false,
+    dataGaps: [],
+    confidence: "high"
+  };
+}
+
+function warehouseCapacityResponse(result: any): AgentResponse {
+  const highest = result.highestUtilisationZone;
+  const nearCapacity = Number(result.fillPercent) >= 90 || Number(highest?.fillPercent ?? 0) >= 90;
+  return {
+    intent: "general_question",
+    status: nearCapacity ? "attention" : "ok",
+    title: "Warehouse Space Utilisation",
+    summary: `The warehouse is ${result.fillPercent}% full: ${Number(result.occupiedUnits).toLocaleString("en-SG")} of ${Number(result.totalCapacity).toLocaleString("en-SG")} capacity units are occupied, leaving ${Number(result.availableCapacity).toLocaleString("en-SG")} units of free capacity.`,
+    facts: [
+      { label: "Overall utilisation", value: `${result.fillPercent}%` },
+      { label: "Occupied capacity", value: `${Number(result.occupiedUnits).toLocaleString("en-SG")} units` },
+      { label: "Total capacity", value: `${Number(result.totalCapacity).toLocaleString("en-SG")} units` },
+      { label: "Free capacity", value: `${Number(result.availableCapacity).toLocaleString("en-SG")} units` },
+      { label: "Storage locations", value: String(result.locationCount) },
+      { label: "Most utilised zone", value: highest ? `${highest.zoneName} · ${highest.fillPercent}%` : "Unavailable" }
+    ],
+    impact: [
+      nearCapacity
+        ? "At least one checked capacity measure is at or above 90%; review space before accepting additional volume."
+        : "The current records do not show an overall warehouse capacity constraint.",
+      highest ? `${highest.zoneName} has ${Number(highest.availableCapacity).toLocaleString("en-SG")} capacity units remaining.` : "Zone-level capacity was unavailable."
+    ],
+    nextAction: { label: "Open Warehouse", type: "locate_warehouse", targetId: null },
+    requiresApproval: false,
+    dataGaps: highest ? [] : ["Zone-level capacity was unavailable."],
+    confidence: "high"
   };
 }
 
@@ -1189,16 +1640,24 @@ function deterministicAgentResponse(
     return {
       intent: "scenario_simulation",
       status: "attention",
-      title: "Facility FEFO Scenario",
-      summary: `A ${presentation.durationLabel} shutdown of ${facilitySimulation.scope} pauses FEFO execution across the warehouse; ${facilitySimulation.expiresDuringOutage.length} released lot(s) expire during the outage and ${facilitySimulation.expiresWithin7DaysAfterRecovery.length} expire within seven days after recovery.`,
+      title: presentation.title,
+      summary: presentation.summary,
       facts: presentation.facts,
       impact: presentation.impacts.length ? presentation.impacts : facilitySimulation.operationalImpact.slice(0, 5),
-      nextAction: { label: "Open Inventory", type: "open_inventory", targetId: null },
+      nextAction: facilitySimulation.affectedFlow === "outbound"
+        ? { label: "Open Logistics", type: "open_logistics", targetId: null }
+        : { label: "Open Inventory", type: "open_inventory", targetId: null },
       requiresApproval: false,
       dataGaps: presentation.dataGaps,
-      confidence: "high"
+      confidence: facilitySimulation.durationKnown === false ? "medium" : "high"
     };
   }
+
+  if (outputs.get_operational_alerts) return operationalAlertsResponse(outputs.get_operational_alerts);
+  if (outputs.get_warehouse_capacity) return warehouseCapacityResponse(outputs.get_warehouse_capacity);
+  if (outputs.locate_sku && intent === "sku_location") return stockLocationResponse(outputs.locate_sku, outputs.check_fefo_impact ?? outputs.check_fefo_allocation);
+  if (outputs.check_dock_schedule) return dockScheduleResponse(outputs.check_dock_schedule);
+  if (outputs.check_cold_chain_status && !requestsTemperatureHistory(query)) return currentTemperatureResponse(outputs.check_cold_chain_status);
 
   if (outputs.get_inventory_planning) {
     const plan = outputs.get_inventory_planning;
@@ -1367,6 +1826,14 @@ function deterministicAgentResponse(
 
 function buildNarrative(intent: string, executions: ToolExecution[], analysisPriority: AnalysisPriority = "balanced") {
   const outputs = Object.fromEntries(executions.map((execution) => [execution.name, execution.output as any]));
+  if (outputs.get_warehouse_capacity) {
+    const capacity = outputs.get_warehouse_capacity;
+    return `Warehouse space utilisation is ${capacity.fillPercent}%: ${capacity.occupiedUnits} of ${capacity.totalCapacity} capacity units are occupied, with ${capacity.availableCapacity} remaining.`;
+  }
+  if (outputs.get_operational_alerts) {
+    const alerts = outputs.get_operational_alerts;
+    return `${alerts.alertCount} ${alerts.statusFilter} operational alert(s): ${alerts.countBySeverity.critical} critical, ${alerts.countBySeverity.warn} warning, and ${alerts.countBySeverity.info} informational.`;
+  }
   if (intent === "stock_position" || intent === "incoming_stock" || intent === "outbound_stock" || intent === "batch_detail" || intent === "fefo_check") {
     const parts: string[] = [];
     if (outputs.get_inventory_planning) {
@@ -1679,14 +2146,28 @@ function alignAgentResponse(
       ...aligned,
       intent: "scenario_simulation",
       status: "attention",
-      title: "Facility FEFO Scenario",
-      summary: `A ${presentation.durationLabel} shutdown of ${facilitySimulation.scope} pauses FEFO execution across the warehouse; ${facilitySimulation.expiresDuringOutage.length} released lot(s) expire during the outage and ${facilitySimulation.expiresWithin7DaysAfterRecovery.length} expire within seven days after recovery.`,
+      title: presentation.title,
+      summary: presentation.summary,
       facts: presentation.facts,
       impact: presentation.impacts.length ? presentation.impacts : facilitySimulation.operationalImpact.slice(0, 5),
-      nextAction: { label: "Open Inventory", type: "open_inventory", targetId: null },
+      nextAction: facilitySimulation.affectedFlow === "outbound"
+        ? { label: "Open Logistics", type: "open_logistics", targetId: null }
+        : { label: "Open Inventory", type: "open_inventory", targetId: null },
       dataGaps: presentation.dataGaps,
-      confidence: "high"
+      confidence: facilitySimulation.durationKnown === false ? "medium" : "high"
     };
+  }
+
+  if (outputs.get_operational_alerts) {
+    aligned = operationalAlertsResponse(outputs.get_operational_alerts);
+  } else if (outputs.get_warehouse_capacity) {
+    aligned = warehouseCapacityResponse(outputs.get_warehouse_capacity);
+  } else if (outputs.locate_sku && routedIntent === "sku_location") {
+    aligned = stockLocationResponse(outputs.locate_sku, outputs.check_fefo_impact ?? outputs.check_fefo_allocation);
+  } else if (outputs.check_dock_schedule) {
+    aligned = dockScheduleResponse(outputs.check_dock_schedule);
+  } else if (outputs.check_cold_chain_status && !requestsTemperatureHistory(query)) {
+    aligned = currentTemperatureResponse(outputs.check_cold_chain_status);
   }
 
   const exactTransport = outputs.get_transport_context?.query && outputs.get_transport_context?.recordCount === 1
@@ -1817,12 +2298,19 @@ async function createStructuredResponseWithOpenAI(
   executions: ToolExecution[],
   draft: Omit<OrchestratorResponse, "agentResponse" | "fallbackUsed">,
   analysisPriority: AnalysisPriority = "balanced",
-  uiContext?: AssistantUiContext
+  uiContext?: AssistantUiContext,
+  semanticPlan?: SemanticRequestPlan | null
 ): Promise<{ agentResponse: AgentResponse; fallbackUsed: boolean }> {
   if (executions.length === 0 && routedIntent === "general_question") {
     return { agentResponse: readOnlyBoundaryAgentResponse(), fallbackUsed: false };
   }
   if (!process.env.OPENAI_API_KEY) {
+    return {
+      agentResponse: deterministicAgentResponse(routedIntent, executions, draft.narrative, query),
+      fallbackUsed: false
+    };
+  }
+  if (Date.now() < openAiUnavailableUntil) {
     return {
       agentResponse: deterministicAgentResponse(routedIntent, executions, draft.narrative, query),
       fallbackUsed: false
@@ -1836,6 +2324,7 @@ async function createStructuredResponseWithOpenAI(
   const model = (process.env.OPENAI_MODEL || "o3-mini").trim();
   const prompt = {
     userQuery: query,
+    semanticRequestPlan: semanticPlan ?? null,
     questionCoverage: {
       namedReferences: [...new Set([...extractTransportReferences(query), ...extractStockReferences(query)])],
       requirement: "Account for every named reference and stated condition in facts, impact, or dataGaps; do not let a broad scenario hide a narrower clause."
@@ -1916,6 +2405,7 @@ async function createStructuredResponseWithOpenAI(
       return { agentResponse: parseAndValidate(completion.choices?.[0]?.message?.content ?? ""), fallbackUsed: false };
     }
   } catch (error) {
+    markOpenAiUnavailable(error);
     console.warn("OpenAI response formatting failed; using the deterministic grounded formatter.", error);
     return {
       agentResponse: deterministicAgentResponse(routedIntent, executions, draft.narrative, query),
@@ -1967,6 +2457,7 @@ export async function processUserQuery(
   let toolFailures: string[];
   let intent: AgentIntent;
   let agentsUsed: AgentName[];
+  let semanticPlan: SemanticRequestPlan | null = null;
 
   if (process.env.OPENAI_API_KEY) {
     // Real agentic tool selection: the model chooses which deterministic tools to call.
@@ -1975,9 +2466,11 @@ export async function processUserQuery(
       const selected = await selectAndRunToolsWithAgent(client, model, query, onProgress, analysisPriority, uiContext);
       executions = selected.executions;
       toolFailures = selected.toolFailures;
-      intent = guessIntentFromExecutions(executions);
+      semanticPlan = selected.semanticPlan;
+      intent = semanticPlan?.requestType === "scenario" ? "scenario_simulation" : semanticPlan?.intent ?? guessIntentFromExecutions(executions);
       agentsUsed = agentsFromExecutions(executions);
-    } catch {
+    } catch (error) {
+      markOpenAiUnavailable(error);
       console.warn("OpenAI tool routing failed; using deterministic warehouse routing.");
       const selected = await runDeterministicRouting(query, onProgress, uiContext);
       executions = selected.executions;
@@ -1994,6 +2487,8 @@ export async function processUserQuery(
     intent = selected.intent;
     agentsUsed = selected.agentsUsed;
   }
+
+  intent = resolveIntentFromVerifiedOutputs(query, intent, executions, semanticPlan);
 
   const fallbackFromToolFailure = executions.length === 0 && toolFailures.length > 0 ? fallbackAgentResponseFor(toolFailures.join(" | ")) : null;
   const { payload, evidence, confidence, riskLevel } = fallbackFromToolFailure
@@ -2030,7 +2525,7 @@ export async function processUserQuery(
 
   const structured = fallbackFromToolFailure
     ? { agentResponse: fallbackFromToolFailure, fallbackUsed: true }
-    : await createStructuredResponseWithOpenAI(query, intent, executions, draft, analysisPriority, uiContext);
+    : await createStructuredResponseWithOpenAI(query, intent, executions, draft, analysisPriority, uiContext, semanticPlan);
   const finalResponse: OrchestratorResponse = {
     ...draft,
     narrative: structured.agentResponse.summary,

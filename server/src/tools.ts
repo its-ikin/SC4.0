@@ -17,6 +17,7 @@ import {
   db,
   getBatchDetail,
   getBatches,
+  getAlerts,
   getDockSchedule,
   getDockAppointments,
   getDocks,
@@ -151,6 +152,7 @@ function movementLabel(value: string | null | undefined) {
 export function locate_sku(stockBalanceId: string) {
   const sku = findInventoryPlacement(stockBalanceId);
   const zone = findZone(sku.zoneId);
+  const batch = getBatches().find((candidate) => candidate.batchId === sku.batchId || candidate.lotCode === sku.batchNo);
   const sameZone = getInventoryPlacements()
     .filter((candidate) => candidate.zoneId === sku.zoneId && candidate.qualityStatus !== "Quarantine")
     .sort((a, b) => new Date(a.expiryDate).getTime() - new Date(b.expiryDate).getTime());
@@ -172,9 +174,19 @@ export function locate_sku(stockBalanceId: string) {
     },
     rack: sku.rack,
     bin: sku.bin,
+    locationId: sku.locationId ?? null,
+    batchId: sku.batchId ?? batch?.batchId ?? null,
     batchNo: sku.batchNo,
+    lotCode: batch?.lotCode ?? sku.batchNo,
+    stoNumber: batch?.stoNumber || null,
+    goodsReceiptNumber: batch?.goodsReceiptNumber || null,
+    handlingUnit: batch?.handlingUnit || null,
+    inspectionLot: batch?.inspectionLot || null,
     expiryDate: sku.expiryDate,
     quantity: sku.quantity,
+    quantityAvailable: sku.qtyAvailable ?? 0,
+    quantityReserved: sku.qtyReserved ?? 0,
+    quantityOnHold: sku.qtyOnHold ?? 0,
     priority: sku.priority,
     temperatureBand: `${sku.temperatureMin}-${sku.temperatureMax} C`,
     qualityReleaseStatus: sku.qualityStatus,
@@ -187,6 +199,41 @@ export function locate_sku(stockBalanceId: string) {
 
 export function get_inventory_summary() {
   return getInventorySummary();
+}
+
+export function get_warehouse_capacity() {
+  const locations = getWarehouseLocations().filter((location) => location.capacity > 0);
+  const stockBalances = getStockBalances();
+  const totalCapacity = locations.reduce((sum, location) => sum + location.capacity, 0);
+  const occupiedUnits = stockBalances.reduce((sum, balance) => sum + balance.qtyOnHand, 0);
+  const availableCapacity = Math.max(0, totalCapacity - occupiedUnits);
+  const fillPercent = totalCapacity ? Math.round(occupiedUnits / totalCapacity * 100) : 0;
+  const grouped = new Map<string, { capacity: number; occupied: number }>();
+  for (const location of locations) {
+    const current = grouped.get(location.zone) ?? { capacity: 0, occupied: 0 };
+    current.capacity += location.capacity;
+    current.occupied += location.currentFill;
+    grouped.set(location.zone, current);
+  }
+  const zones = [...grouped.entries()]
+    .map(([zoneName, values]) => ({
+      zoneName,
+      capacity: values.capacity,
+      occupiedUnits: values.occupied,
+      availableCapacity: Math.max(0, values.capacity - values.occupied),
+      fillPercent: values.capacity ? Math.round(values.occupied / values.capacity * 100) : 0
+    }))
+    .sort((a, b) => b.fillPercent - a.fillPercent || a.zoneName.localeCompare(b.zoneName));
+
+  return {
+    totalCapacity,
+    occupiedUnits,
+    availableCapacity,
+    fillPercent,
+    locationCount: locations.length,
+    zones,
+    highestUtilisationZone: zones[0] ?? null
+  };
 }
 
 export function search_inventory(query = "", filtersInput: unknown = [], sort = "Earliest expiry") {
@@ -1024,10 +1071,23 @@ function overlaps(a: DockSchedule, b: DockSchedule) {
   return new Date(a.startTime).getTime() < new Date(b.endTime).getTime() && new Date(b.startTime).getTime() < new Date(a.endTime).getTime();
 }
 
-export function check_dock_schedule(timeWindow: string, shipmentId?: string) {
+function normaliseDockId(value?: string) {
+  const match = String(value ?? "").trim().match(/^(?:dock\s*)?d?\s*(\d+)$/i);
+  return match ? `D${Number(match[1])}` : undefined;
+}
+
+export function check_dock_schedule(timeWindow: string, shipmentId?: string, dockIdInput?: string) {
   const hours = parseHours(timeWindow);
+  const dockId = normaliseDockId(dockIdInput);
+  const dockState = dockId ? getDocks().find((dock) => dock.id === dockId) ?? null : null;
+  if (dockId && !dockState) throw new Error(`Dock ${dockId} was not found in the simulated warehouse database.`);
+  const now = Date.now();
   const cutoff = Date.now() + hours * 60 * 60_000;
-  const schedules = getDockSchedule().filter((slot) => new Date(slot.startTime).getTime() <= cutoff);
+  const schedules = getDockSchedule().filter((slot) =>
+    (!dockId || slot.dockId === dockId)
+    && new Date(slot.startTime).getTime() <= cutoff
+    && new Date(slot.endTime).getTime() >= now
+  );
   const conflicts: Array<{ dockId: string; shipmentIds: string[]; startTime: string; endTime: string }> = [];
   for (const slot of schedules) {
     for (const other of schedules) {
@@ -1044,7 +1104,7 @@ export function check_dock_schedule(timeWindow: string, shipmentId?: string) {
   }
   const bookedDocks = new Set(schedules.map((slot) => slot.dockId));
   const availableSlots = getDocks()
-    .filter((dock) => !bookedDocks.has(dock.id) || dock.status === "available")
+    .filter((dock) => (!dockId || dock.id === dockId) && (!bookedDocks.has(dock.id) || dock.status === "available"))
     .map((dock) => ({
       dockId: dock.id,
       dockName: dock.name,
@@ -1055,7 +1115,10 @@ export function check_dock_schedule(timeWindow: string, shipmentId?: string) {
 
   return {
     timeWindow,
+    dockId: dockId ?? null,
+    dockState,
     shipmentId: shipmentId ?? null,
+    scheduledAppointments: schedules,
     dockSlotConflicts: conflicts,
     availableSlots,
     affectedShipments,
@@ -1065,6 +1128,33 @@ export function check_dock_schedule(timeWindow: string, shipmentId?: string) {
       "Keep non-cold-chain shipments behind FEFO-sensitive vaccine batches."
     ],
     dockUtilisationImpact
+  };
+}
+
+export function get_operational_alerts(statusInput = "open", severityInput?: string) {
+  const status = statusInput.trim().toLowerCase();
+  const severity = severityInput?.trim().toLowerCase();
+  const alerts = getAlerts(1000).filter((alert) =>
+    (status === "all" || alert.status.toLowerCase() === status)
+    && (!severity || severity === "all" || alert.severity.toLowerCase() === severity)
+  );
+  const countBySeverity = {
+    critical: alerts.filter((alert) => alert.severity === "critical").length,
+    warn: alerts.filter((alert) => alert.severity === "warn").length,
+    info: alerts.filter((alert) => alert.severity === "info").length
+  };
+  const countBySource = alerts.reduce<Record<string, number>>((counts, alert) => {
+    counts[alert.sourceAgent] = (counts[alert.sourceAgent] ?? 0) + 1;
+    return counts;
+  }, {});
+
+  return {
+    statusFilter: status || "open",
+    severityFilter: severity || "all",
+    alertCount: alerts.length,
+    countBySeverity,
+    countBySource,
+    alerts: alerts.slice(0, 20)
   };
 }
 
@@ -1093,18 +1183,30 @@ function warehouseSummary() {
  * Read-only facility outage scenario. Unlike route disruption tools, this evaluates the
  * complete warehouse inventory and work queue and never assumes a particular transport route.
  */
-export function simulate_facility_disruption(eventTypeInput: string, durationMinutesInput?: number | string) {
-  const eventType = eventTypeInput.trim().toLowerCase().replace(/[ -]+/g, "_");
-  const validEvents = new Set(["severe_weather", "facility_shutdown", "tornado", "flood", "earthquake", "power_outage"]);
-  if (!validEvents.has(eventType)) throw new Error(`Unsupported facility scenario ${eventTypeInput}.`);
-
+export function simulate_facility_disruption(
+  eventTypeInput: string,
+  durationMinutesInput?: number | string,
+  scopeInput?: string,
+  leadTimeMinutesInput?: number | string,
+  affectedFlowInput?: string
+) {
+  const eventType = eventTypeInput.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "external_disruption";
   const requestedDuration = Number(durationMinutesInput);
-  const durationMinutes = Number.isFinite(requestedDuration) && requestedDuration > 0
+  const durationKnown = Number.isFinite(requestedDuration) && requestedDuration > 0;
+  const durationMinutes = durationKnown
     ? Math.min(5 * 365 * 24 * 60, Math.round(requestedDuration))
-    : 7 * 24 * 60;
-  const scenarioStart = new Date();
-  const scenarioEnd = new Date(scenarioStart.getTime() + durationMinutes * 60_000);
-  const restartReviewEnd = new Date(scenarioEnd.getTime() + 7 * 24 * 60 * 60_000);
+    : null;
+  const requestedLeadTime = Number(leadTimeMinutesInput);
+  const leadTimeMinutes = Number.isFinite(requestedLeadTime) && requestedLeadTime > 0
+    ? Math.min(30 * 24 * 60, Math.round(requestedLeadTime))
+    : 0;
+  const affectedFlow = ["inbound", "outbound", "all"].includes(String(affectedFlowInput).toLowerCase())
+    ? String(affectedFlowInput).toLowerCase()
+    : "all";
+  const requestedScope = scopeInput?.trim() || "Scope not specified";
+  const scenarioStart = new Date(Date.now() + leadTimeMinutes * 60_000);
+  const scenarioEnd = durationMinutes === null ? null : new Date(scenarioStart.getTime() + durationMinutes * 60_000);
+  const restartReviewEnd = scenarioEnd === null ? null : new Date(scenarioEnd.getTime() + 7 * 24 * 60 * 60_000);
 
   const products = new Map(getProducts().map((product) => [product.productId, product]));
   const batches = new Map(getBatches().map((batch) => [batch.batchId, batch]));
@@ -1126,12 +1228,12 @@ export function simulate_facility_disruption(eventTypeInput: string, durationMin
     };
   };
   const expiresDuringOutage = releasedBalances
-    .filter((balance) => new Date(batches.get(balance.batchId)!.expiryDate).getTime() <= scenarioEnd.getTime())
+    .filter((balance) => scenarioEnd !== null && new Date(batches.get(balance.batchId)!.expiryDate).getTime() <= scenarioEnd.getTime())
     .map(toRiskLot);
   const expiresWithin7DaysAfterRecovery = releasedBalances
     .filter((balance) => {
       const expiry = new Date(batches.get(balance.batchId)!.expiryDate).getTime();
-      return expiry > scenarioEnd.getTime() && expiry <= restartReviewEnd.getTime();
+      return scenarioEnd !== null && restartReviewEnd !== null && expiry > scenarioEnd.getTime() && expiry <= restartReviewEnd.getTime();
     })
     .map(toRiskLot);
   const restrictedLots = balances
@@ -1152,11 +1254,16 @@ export function simulate_facility_disruption(eventTypeInput: string, durationMin
   const inWindow = (value: string | null | undefined) => {
     if (!value) return false;
     const timestamp = new Date(value).getTime();
-    return Number.isFinite(timestamp) && timestamp >= scenarioStart.getTime() && timestamp <= scenarioEnd.getTime();
+    return Number.isFinite(timestamp) && timestamp >= scenarioStart.getTime() && scenarioEnd !== null && timestamp <= scenarioEnd.getTime();
+  };
+  const exposedAtOnset = (value: string | null | undefined) => {
+    if (!value) return true;
+    const timestamp = new Date(value).getTime();
+    return !Number.isFinite(timestamp) || timestamp <= scenarioStart.getTime();
   };
   const inboundAffected = getInboundShipments()
     .filter((shipment) => !["Received", "Released", "Putaway", "Putaway Complete", "Closed"].includes(shipment.inboundStatus))
-    .filter((shipment) => inWindow(shipment.plannedArrival || shipment.eta))
+    .filter((shipment) => durationKnown ? inWindow(shipment.plannedArrival || shipment.eta) : exposedAtOnset(shipment.plannedArrival || shipment.eta))
     .map((shipment) => ({
       asnId: shipment.asnId,
       plannedArrival: shipment.plannedArrival || shipment.eta,
@@ -1165,7 +1272,7 @@ export function simulate_facility_disruption(eventTypeInput: string, durationMin
     }));
   const outboundAffected = getOutboundShipments()
     .filter((shipment) => !["Dispatched", "Delivered"].includes(shipment.outboundStatus))
-    .filter((shipment) => inWindow(shipment.plannedDeparture || shipment.requiredBy))
+    .filter((shipment) => durationKnown ? inWindow(shipment.plannedDeparture || shipment.requiredBy) : exposedAtOnset(shipment.plannedDeparture || shipment.requiredBy))
     .map((shipment) => ({
       shipmentId: shipment.shipmentId,
       plannedDeparture: shipment.plannedDeparture || shipment.requiredBy,
@@ -1181,36 +1288,51 @@ export function simulate_facility_disruption(eventTypeInput: string, durationMin
   ])];
 
   return {
-    scope: "Singapore Western DC",
-    eventType: eventType === "tornado" ? "severe_weather" : eventType,
+    scope: requestedScope,
+    dataScope: "Singapore Western DC and its connected warehouse transport records",
+    eventType,
+    affectedFlow,
+    leadTimeMinutes,
+    durationKnown,
     durationMinutes,
     scenarioStart: scenarioStart.toISOString(),
-    scenarioEnd: scenarioEnd.toISOString(),
+    scenarioEnd: scenarioEnd?.toISOString() ?? null,
     expiresDuringOutage,
     expiresDuringOutageUnits: duringOutageUnits,
     expiresWithin7DaysAfterRecovery,
     restartCriticalUnits,
     restrictedLots,
-    inboundAffected,
-    outboundAffected,
+    inboundAffected: affectedFlow === "outbound" ? [] : inboundAffected,
+    outboundAffected: affectedFlow === "inbound" ? [] : outboundAffected,
     affectedSkus: [...new Set([...expiresDuringOutage, ...expiresWithin7DaysAfterRecovery].map((lot) => lot.productCode))],
     affectedStockBalances,
     affectedStages: ["Receiving", "Quality disposition", "Putaway", "Storage", "Picking", "Packing", "Dock Staging", "Dispatch"],
-    operationalImpact: [
-      "FEFO allocation execution pauses while the facility is inaccessible; the system's expiry order is not permission to allocate during the outage.",
-      `${expiresDuringOutage.length} released lot(s) / ${duringOutageUnits} available unit(s) expire during the outage; ${expiresWithin7DaysAfterRecovery.length} released lot(s) / ${restartCriticalUnits} unit(s) expire within seven days after recovery.`,
-      `${inboundAffected.length} inbound movement(s) cannot be received or put away and ${outboundAffected.length} outbound movement(s) cannot be picked, staged, or dispatched as scheduled.`,
-      "Recalculate FEFO eligibility and remove expired or newly restricted lots before allocation resumes."
-    ],
+    operationalImpact: durationKnown
+      ? [
+          "FEFO allocation execution pauses while the affected operation is inaccessible; the system's expiry order is not permission to allocate during the disruption.",
+          `${expiresDuringOutage.length} released lot(s) / ${duringOutageUnits} available unit(s) expire during the disruption; ${expiresWithin7DaysAfterRecovery.length} released lot(s) / ${restartCriticalUnits} unit(s) expire within seven days after recovery.`,
+          `${affectedFlow === "outbound" ? 0 : inboundAffected.length} inbound movement(s) and ${affectedFlow === "inbound" ? 0 : outboundAffected.length} outbound movement(s) fall in the disruption window.`,
+          "Recalculate FEFO eligibility and remove expired or newly restricted lots before allocation resumes."
+        ]
+      : [
+          `${eventType.replaceAll("_", " ")} is stated to begin in ${leadTimeMinutes} minute(s); ${affectedFlow === "inbound" ? 0 : outboundAffected.length} open outbound and ${affectedFlow === "outbound" ? 0 : inboundAffected.length} open inbound movement(s) are exposed at onset.`,
+          "The disruption duration was not provided, so expiry exposure and recovery timing cannot be quantified without inventing an assumption.",
+          "Quality restrictions, FEFO eligibility, and cold-chain controls remain binding regardless of the external event."
+        ],
     mitigationOptions: [
       { label: "Pre-outage FEFO review", tradeoff: "Protects the shortest-dated released stock but is limited by the time and safe access available before closure." },
       { label: "Divert inbound receipts", tradeoff: "Avoids arrivals at a closed facility but requires an approved alternate receiving and cold-chain site." },
       { label: "Controlled restart", tradeoff: "Revalidates expiry, quality status, and stock condition before allocation, at the cost of a slower recovery." }
     ],
     assumptions: [
-      "The facility is inaccessible for the full stated duration.",
-      "No inventory movement is assumed during the outage.",
+      durationKnown ? "The affected operation is inaccessible for the full stated duration." : "No disruption duration was assumed.",
+      `The requested scope is ${requestedScope}; available records cover ${"Singapore Western DC and its connected transport network"}.`,
       "Temperature-control continuity is unknown and is not inferred from the weather event."
+    ],
+    dataGaps: [
+      ...(durationKnown ? [] : ["Expected disruption duration was not provided."]),
+      ...(requestedScope === "Scope not specified" ? ["Affected facility or network scope was not provided."] : []),
+      "Physical damage, access, utility continuity, and alternate-site capacity are not available in the warehouse records."
     ],
     recommendedActionId: null,
     mutationApplied: false
@@ -1543,6 +1665,8 @@ export async function runTool(toolName: string, input: Record<string, unknown>) 
   switch (toolName) {
     case "get_inventory_summary":
       return get_inventory_summary();
+    case "get_warehouse_capacity":
+      return get_warehouse_capacity();
     case "search_inventory":
       return search_inventory(String(input.query ?? ""), input.filters, String(input.sort ?? "Earliest expiry"));
     case "get_product_stock":
@@ -1585,14 +1709,23 @@ export async function runTool(toolName: string, input: Record<string, unknown>) 
       );
     case "get_audit_lookup":
       return get_audit_lookup(String(input.query ?? ""));
+    case "get_operational_alerts":
+      return get_operational_alerts(String(input.status ?? "open"), input.severity ? String(input.severity) : undefined);
     case "check_dock_schedule":
-      return check_dock_schedule(String(input.timeWindow ?? "next 4 hours"), input.shipmentId ? String(input.shipmentId) : undefined);
+      return check_dock_schedule(
+        String(input.timeWindow ?? "next 4 hours"),
+        input.shipmentId ? String(input.shipmentId) : undefined,
+        input.dockId ? String(input.dockId) : undefined
+      );
     case "simulate_reprioritisation":
       return simulate_reprioritisation(String(input.shipmentId));
     case "simulate_facility_disruption":
       return simulate_facility_disruption(
         String(input.eventType ?? "facility_shutdown"),
-        input.durationMinutes === undefined ? undefined : Number(input.durationMinutes)
+        input.durationMinutes === undefined ? undefined : Number(input.durationMinutes),
+        input.scope === undefined ? undefined : String(input.scope),
+        input.leadTimeMinutes === undefined ? undefined : Number(input.leadTimeMinutes),
+        input.affectedFlow === undefined ? undefined : String(input.affectedFlow)
       );
     case "simulate_event_impact":
       return simulate_event_impact(String(input.eventType), String(input.affectedRoute));
@@ -1614,6 +1747,9 @@ export function summariseToolCall(toolName: string, input: Record<string, unknow
   switch (toolName) {
     case "get_inventory_summary":
       conciseOutput = `On Hand ${output.onHand}, Available ${output.available}, Reserved ${output.reserved}, QA Hold ${output.qaHold}`;
+      break;
+    case "get_warehouse_capacity":
+      conciseOutput = `${output.fillPercent}% full: ${output.occupiedUnits} of ${output.totalCapacity} capacity units`;
       break;
     case "search_inventory":
       conciseOutput = `${output.products?.length ?? 0} product match(es), ${output.inbound?.length ?? 0} inbound, ${output.outbound?.length ?? 0} outbound`;
@@ -1663,14 +1799,19 @@ export function summariseToolCall(toolName: string, input: Record<string, unknow
     case "get_audit_lookup":
       conciseOutput = `${output.enquiryCount} assistant enquiry record(s)`;
       break;
+    case "get_operational_alerts":
+      conciseOutput = `${output.alertCount} ${output.statusFilter} alert(s): ${output.countBySeverity.critical} critical, ${output.countBySeverity.warn} warning`;
+      break;
     case "check_dock_schedule":
-      conciseOutput = `${output.dockSlotConflicts.length} conflict(s), utilisation impact ${output.dockUtilisationImpact}%`;
+      conciseOutput = `${output.dockId ?? "All docks"}: ${output.scheduledAppointments.length} appointment(s), ${output.dockSlotConflicts.length} conflict(s)`;
       break;
     case "simulate_reprioritisation":
       conciseOutput = `${output.shipmentId} advisory simulation only`;
       break;
     case "simulate_facility_disruption":
-      conciseOutput = `${output.scope}: ${output.durationMinutes} min outage, ${output.expiresDuringOutage.length} lot(s) expiring during outage, ${output.expiresWithin7DaysAfterRecovery.length} restart-critical lot(s)`;
+      conciseOutput = output.durationKnown
+        ? `${output.scope}: ${output.durationMinutes} min disruption, ${output.expiresDuringOutage.length} lot(s) expiring during, ${output.expiresWithin7DaysAfterRecovery.length} restart-critical lot(s)`
+        : `${output.scope}: ${output.eventType} in ${output.leadTimeMinutes} min, duration unavailable, ${output.outboundAffected.length} outbound exposure(s)`;
       break;
     case "simulate_event_impact":
       conciseOutput = `${output.affectedRoute} +${output.inboundEtaImpactMinutes} min, advisory simulation only`;

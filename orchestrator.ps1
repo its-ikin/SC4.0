@@ -244,8 +244,6 @@ function Start-System {
   }
   Write-Host ""
   Write-Host "TwinOps is available at http://localhost:$ClientPort"
-  Write-Host "Opening browser..."
-  Start-Process "http://localhost:$ClientPort"
 }
 
 function Stop-System {

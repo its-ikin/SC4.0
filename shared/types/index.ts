@@ -698,6 +698,7 @@ export const agentActionTypeValues = [
   "locate_warehouse",
   "open_logistics",
   "open_monitoring",
+  "open_alerts",
   "open_audit",
   "run_fefo_check",
   "run_simulation",

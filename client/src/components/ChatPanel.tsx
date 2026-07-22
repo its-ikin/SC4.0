@@ -281,6 +281,7 @@ function StructuredAgentCard({
   const setLogisticsWorkspace = useAppStore((state) => state.setLogisticsWorkspace);
   const setWarehouseWorkspace = useAppStore((state) => state.setWarehouseWorkspace);
   const setSelectedZone = useAppStore((state) => state.setSelectedZone);
+  const openAlertsPage = useAppStore((state) => state.openAlertsPage);
   const setScenarioResult = useAppStore((state) => state.setScenarioResult);
   const addMessage = useAppStore((state) => state.addMessage);
   const [actionBusy, setActionBusy] = useState(false);
@@ -331,6 +332,10 @@ function StructuredAgentCard({
     if (action.type === "open_monitoring" || action.type === "review_non_conformance") {
       if (targetId && !targetId.startsWith("NC-") && !targetId.startsWith("TE-")) setSelectedZone(targetId);
       setView("Monitoring");
+      return;
+    }
+    if (action.type === "open_alerts") {
+      openAlertsPage();
       return;
     }
     if (action.type === "open_audit") {
@@ -1010,14 +1015,12 @@ export default function ChatPanel() {
   const setHighlightFromResponse = useAppStore((state) => state.setHighlightFromResponse);
 
   useEffect(() => {
-    if (inventoryMode && !assistantQueryRequest) {
+    if (inventoryMode) {
       setTab("inspector");
       return;
     }
-    if (!inventoryMode) {
-      setTab((current) => (current === "inspector" ? "chat" : current));
-    }
-  }, [inventoryMode, view, assistantQueryRequest]);
+    setTab((current) => (current === "inspector" ? "chat" : current));
+  }, [inventoryMode, view]);
 
   const conversationMessages = messages.filter((message) => message.role !== "autonomous");
   const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -1109,7 +1112,6 @@ export default function ChatPanel() {
     ) return;
     consumedAssistantQueryRequestIdRef.current = assistantQueryRequest.id;
     clearAssistantQueryRequest(assistantQueryRequest.id);
-    setTab("chat");
     void sendQuery(assistantQueryRequest.text);
   }, [assistantQueryRequest, busy, clearAssistantQueryRequest, sendQuery]);
 
