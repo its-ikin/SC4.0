@@ -35,7 +35,8 @@ export default function App() {
 
   useEffect(() => {
     getWarehouse().then(setSnapshot).catch(console.error);
-    const socket = io();
+    const API_BASE = import.meta.env.VITE_API_URL || "";
+    const socket = io(API_BASE);
     socket.on("temperature:update", (event: Omit<TemperatureReading, "id" | "temperature"> & { temp: number }) => {
       useAppStore.setState((state) => {
         if (!state.snapshot) return state;
