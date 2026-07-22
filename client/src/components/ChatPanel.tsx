@@ -1010,12 +1010,14 @@ export default function ChatPanel() {
   const setHighlightFromResponse = useAppStore((state) => state.setHighlightFromResponse);
 
   useEffect(() => {
-    if (inventoryMode) {
+    if (inventoryMode && !assistantQueryRequest) {
       setTab("inspector");
       return;
     }
-    setTab((current) => (current === "inspector" ? "chat" : current));
-  }, [inventoryMode, view]);
+    if (!inventoryMode) {
+      setTab((current) => (current === "inspector" ? "chat" : current));
+    }
+  }, [inventoryMode, view, assistantQueryRequest]);
 
   const conversationMessages = messages.filter((message) => message.role !== "autonomous");
   const chatScrollRef = useRef<HTMLDivElement>(null);
